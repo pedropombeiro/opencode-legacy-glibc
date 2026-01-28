@@ -1,0 +1,16 @@
+#!/bin/sh
+# Wrapper script to run opencode with bundled musl libraries
+# This enables running on systems with older GLIBC versions
+
+SCRIPT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+
+# Set up the musl loader symlink (binary is patched to look here)
+LOADER_DIR="/tmp/.opencode-ld"
+LOADER_PATH="${LOADER_DIR}/ld-musl-x86_64.so.1"
+if [ ! -e "$LOADER_PATH" ] || [ "$(readlink -f "$LOADER_PATH" 2>/dev/null)" != "${SCRIPT_DIR}/lib/ld-musl-x86_64.so.1" ]; then
+    mkdir -p "$LOADER_DIR" 2>/dev/null
+    ln -sf "${SCRIPT_DIR}/lib/ld-musl-x86_64.so.1" "$LOADER_PATH" 2>/dev/null
+fi
+
+LD_LIBRARY_PATH="${SCRIPT_DIR}/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+    exec "${SCRIPT_DIR}/bin/opencode.bin" "$@"
