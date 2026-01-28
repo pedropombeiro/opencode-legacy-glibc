@@ -2,6 +2,8 @@
 
 Automated builds of [OpenCode](https://github.com/anomalyco/opencode) with bundled musl libraries for systems with older GLIBC versions (e.g., QNAP NAS).
 
+[![Build for legacy GLIBC](https://github.com/pedropombeiro/opencode-legacy-glibc/actions/workflows/build.yml/badge.svg)](https://github.com/pedropombeiro/opencode-legacy-glibc/actions/workflows/build.yml)
+
 ## Installation
 
 ### Using mise
