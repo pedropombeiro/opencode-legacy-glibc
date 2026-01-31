@@ -31,7 +31,7 @@ RUN chmod +x /opencode/bin/opencode
 FROM --platform=$BUILD_PLATFORM alpine:latest AS ldpreload
 RUN apk add --no-cache gcc musl-dev
 COPY clear_ldpath.c /tmp/
-RUN gcc -shared -fPIC -o /opencode/lib/clear_ldpath.so /tmp/clear_ldpath.c
+RUN mkdir -p /opencode/lib && gcc -shared -fPIC -o /opencode/lib/clear_ldpath.so /tmp/clear_ldpath.c
 
 FROM scratch AS export
 COPY --from=builder /build/packages/opencode/dist/opencode-linux-x64-baseline-musl/bin/opencode /opencode/bin/opencode.bin
