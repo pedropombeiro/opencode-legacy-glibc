@@ -29,9 +29,14 @@ FROM alpine:latest AS wrapper
 COPY opencode /opencode/bin/opencode
 RUN chmod +x /opencode/bin/opencode
 
-FROM scratch AS export
-COPY --from=builder /build/packages/opencode/dist/opencode-linux-x64-baseline-musl/bin/opencode /opencode/bin/opencode.bin
+# Create symlink for musl libc (the loader and libc are the same file in musl)
+FROM alpine:latest AS libs
 COPY --from=musl /lib/ld-musl-x86_64.so.1 /opencode/lib/
 COPY --from=musl /usr/lib/libstdc++.so.6 /opencode/lib/
 COPY --from=musl /usr/lib/libgcc_s.so.1 /opencode/lib/
+RUN ln -s ld-musl-x86_64.so.1 /opencode/lib/libc.musl-x86_64.so.1
+
+FROM scratch AS export
+COPY --from=builder /build/packages/opencode/dist/opencode-linux-x64-baseline-musl/bin/opencode /opencode/bin/opencode.bin
+COPY --from=libs /opencode/lib/ /opencode/lib/
 COPY --from=wrapper /opencode/bin/opencode /opencode/bin/opencode
