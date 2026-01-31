@@ -12,4 +12,8 @@ if [ ! -e "$LOADER_PATH" ] || [ "$(readlink -f "$LOADER_PATH" 2>/dev/null)" != "
     ln -sf "${SCRIPT_DIR}/lib/ld-musl-x86_64.so.1" "$LOADER_PATH" 2>/dev/null
 fi
 
-exec "${SCRIPT_DIR}/bin/opencode.bin" "$@"
+# Use LD_PRELOAD to clear LD_LIBRARY_PATH after the binary loads
+# This prevents child processes from inheriting the musl library paths
+LD_PRELOAD="${SCRIPT_DIR}/lib/clear_ldpath.so" \
+    LD_LIBRARY_PATH="${SCRIPT_DIR}/lib" \
+    exec "${SCRIPT_DIR}/bin/opencode.bin" "$@"
