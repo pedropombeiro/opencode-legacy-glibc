@@ -15,7 +15,10 @@ RUN bun install
 RUN OPENCODE_VERSION="${VERSION#v}" ./packages/opencode/script/build.ts
 
 # Patch the binary to use a custom interpreter path that we'll symlink at runtime
+# Also set RPATH so the binary finds its libraries without LD_LIBRARY_PATH
+# (this prevents child processes from inheriting the musl library paths)
 RUN patchelf --set-interpreter /tmp/.opencode-ld/ld-musl-x86_64.so.1 \
+    --set-rpath '$ORIGIN/../lib' \
     /build/packages/opencode/dist/opencode-linux-x64-baseline-musl/bin/opencode
 
 # Get musl and libs from Alpine (x86_64 for QNAP target)
