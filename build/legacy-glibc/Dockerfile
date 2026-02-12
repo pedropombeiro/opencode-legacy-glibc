@@ -1,6 +1,6 @@
 # Build on linux/amd64 to ensure correct baseline binary
 ARG BUILD_PLATFORM=linux/amd64
-FROM --platform=$BUILD_PLATFORM oven/bun:1.3.8-debian AS builder
+FROM --platform=$BUILD_PLATFORM oven/bun:debian AS builder
 
 ARG VERSION
 
