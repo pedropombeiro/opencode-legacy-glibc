@@ -2,7 +2,7 @@ name: Build for legacy GLIBC
 
 on:
   schedule:
-    - cron: "0 */6 * * *" # Every 6 hours
+    - cron: "0 * * * *" # Every hour
   workflow_dispatch:
     inputs:
       tag:
