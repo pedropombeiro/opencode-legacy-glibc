@@ -6,8 +6,9 @@
  * 2. Child processes spawned by the binary won't inherit these variables
  *    (so they use the system's native libraries instead of bundled musl libs)
  *
- * Note: This prevents plugins from being installed since bun subprocesses
- * also won't find their libraries. This is a known limitation.
+ * When opencode re-executes itself for plugin installation, it invokes
+ * process.execPath (opencode.bin), which is a shell wrapper that re-sets
+ * LD_LIBRARY_PATH and LD_PRELOAD before exec'ing the real binary.
  */
 
 #include <stdlib.h>
