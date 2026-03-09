@@ -159,3 +159,20 @@ docker run --platform linux/amd64 --rm opencode-legacy-test sh -c '
   git --version  # Should use system git, not musl-linked
 '
 ```
+
+### Test across multiple GLIBC versions
+
+Additional test Dockerfiles are provided for broader coverage:
+- `build/test/Dockerfile` — Debian Stretch (GLIBC 2.24)
+- `build/test/Dockerfile.buster` — Debian Buster (GLIBC 2.28)
+- `build/test/Dockerfile.centos7` — CentOS 7 (GLIBC 2.17)
+
+Tested and passing (as of v1.2.22):
+
+| Image | GLIBC | Wrapper | Plugin Install | git |
+|-------|-------|---------|---------------|-----|
+| centos:7 | 2.17 | OK | OK | OK |
+| debian:stretch-slim | 2.24 | OK | OK | OK |
+| debian:buster-slim | 2.28 | OK | OK | OK |
+| ubuntu:20.04 | 2.31 | OK | OK | OK |
+| debian:bookworm-slim | 2.36 | OK | OK | OK |
