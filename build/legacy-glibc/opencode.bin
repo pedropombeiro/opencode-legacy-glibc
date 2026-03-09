@@ -1,11 +1,11 @@
 #!/bin/sh
 # Inner wrapper for opencode - invoked by the user-facing wrapper.
 # Sets LD_LIBRARY_PATH so the musl dynamic linker can find bundled libs,
-# and LD_PRELOAD to load clear_ldpath.so which removes LD_PRELOAD from
-# the environment (preventing the .so from propagating to descendants).
+# and LD_PRELOAD to load clear_ldpath.so which clears both LD_PRELOAD
+# and LD_LIBRARY_PATH from the environment for child processes.
 
 SCRIPT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 
 LD_PRELOAD="${SCRIPT_DIR}/lib/clear_ldpath.so" \
     LD_LIBRARY_PATH="${SCRIPT_DIR}/lib" \
-    exec "${SCRIPT_DIR}/lib/opencode" "$@"
+    exec "${SCRIPT_DIR}/lib/opencode.bin" "$@"

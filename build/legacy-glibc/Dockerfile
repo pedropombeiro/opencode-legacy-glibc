@@ -27,21 +27,36 @@ COPY opencode /opencode/bin/opencode
 COPY opencode.bin /opencode/bin/opencode.bin
 RUN chmod +x /opencode/bin/opencode /opencode/bin/opencode.bin
 
-# Build a self-contained shared library with no dynamic dependencies.
-# Uses -nostdlib so the .so doesn't link against musl libc. This is critical
-# because Bun leaks LD_PRELOAD to child processes, and glibc children would
-# crash trying to load a musl-dependent .so.
+# Build clear_ldpath.so: self-contained shared library with no dynamic deps.
+# Uses -nostdlib so glibc children can load it harmlessly when LD_PRELOAD leaks.
 FROM --platform=$BUILD_PLATFORM alpine:latest AS ldpreload
 RUN apk add --no-cache gcc musl-dev
 COPY clear_ldpath.c /tmp/
 RUN mkdir -p /opencode/lib && gcc -shared -fPIC -nostdlib \
     -o /opencode/lib/clear_ldpath.so /tmp/clear_ldpath.c
 
-FROM scratch AS export
-COPY --from=builder /build/packages/opencode/dist/opencode-linux-x64-baseline-musl/bin/opencode /opencode/lib/opencode
+# Build the ELF wrapper that sits at lib/opencode (where process.execPath points).
+# It re-establishes LD_LIBRARY_PATH and LD_PRELOAD before exec'ing the real binary.
+# Static musl binary so it runs on any Linux regardless of glibc version.
+FROM --platform=$BUILD_PLATFORM alpine:latest AS elfwrapper
+RUN apk add --no-cache gcc musl-dev
+COPY wrapper.c /tmp/
+RUN mkdir -p /opencode && gcc -static -o /opencode/wrapper /tmp/wrapper.c
+
+FROM alpine:latest AS assemble
+RUN mkdir -p /opencode/lib /opencode/bin
+COPY --from=builder /build/packages/opencode/dist/opencode-linux-x64-baseline-musl/bin/opencode /opencode/lib/opencode.bin
 COPY --from=musl /lib/ld-musl-x86_64.so.1 /opencode/lib/
 COPY --from=musl /usr/lib/libstdc++.so.6 /opencode/lib/
 COPY --from=musl /usr/lib/libgcc_s.so.1 /opencode/lib/
 COPY --from=ldpreload /opencode/lib/clear_ldpath.so /opencode/lib/
+COPY --from=elfwrapper /opencode/wrapper /opencode/lib/opencode
 COPY --from=wrapper /opencode/bin/opencode /opencode/bin/opencode
 COPY --from=wrapper /opencode/bin/opencode.bin /opencode/bin/opencode.bin
+# opencode.elf symlinks to opencode (the ELF wrapper) so that
+# process.execPath resolves to lib/opencode, ensuring re-invocations
+# go through the wrapper which re-establishes LD_LIBRARY_PATH.
+RUN ln -s opencode /opencode/lib/opencode.elf
+
+FROM scratch AS export
+COPY --from=assemble /opencode /opencode

@@ -1,11 +1,14 @@
 #!/bin/sh
-# Deterministic tests for the LD_LIBRARY_PATH / LD_PRELOAD / clear_ldpath.so
-# interaction. Runs inside a test container with the legacy-glibc opencode build.
+# Deterministic tests for the legacy-glibc opencode build.
 # No LLM API key required.
 #
-# clear_ldpath.so is compiled with -nostdlib (no libc dependency). It only
-# clears LD_PRELOAD from the environ. LD_LIBRARY_PATH is intentionally kept:
-# it's harmless to glibc children and needed by process.execPath re-invocations.
+# Architecture:
+#   bin/opencode      -> bin/opencode.bin -> lib/opencode.elf (normal path)
+#   lib/opencode      -> ELF wrapper that re-establishes env -> lib/opencode.elf
+#   clear_ldpath.so   -> clears LD_PRELOAD + LD_LIBRARY_PATH from environ
+#
+# process.execPath resolves to lib/opencode (the ELF wrapper), which
+# re-establishes LD_LIBRARY_PATH and LD_PRELOAD before exec'ing opencode.elf.
 #
 # Usage: docker run --platform linux/amd64 --rm <image> sh /opt/test-env.sh
 
@@ -31,7 +34,16 @@ else
 fi
 
 echo ""
-echo "=== 2. clear_ldpath.so has no dynamic dependencies ==="
+echo "=== 2. ELF wrapper (lib/opencode) launches opencode ==="
+OC_VER=$("$LIB/opencode" --version 2>&1) || true
+if echo "$OC_VER" | grep -qE '^[0-9]+\.[0-9]+'; then
+  pass "lib/opencode ELF wrapper works: v$OC_VER"
+else
+  fail "lib/opencode ELF wrapper failed: $OC_VER"
+fi
+
+echo ""
+echo "=== 3. clear_ldpath.so has no dynamic dependencies ==="
 NEEDED=$(readelf -d "$LIB/clear_ldpath.so" 2>/dev/null | grep NEEDED || true)
 if [ -z "$NEEDED" ]; then
   pass "clear_ldpath.so is self-contained (no NEEDED entries)"
@@ -40,7 +52,7 @@ else
 fi
 
 echo ""
-echo "=== 3. glibc child can load clear_ldpath.so via LD_PRELOAD ==="
+echo "=== 4. glibc child can load clear_ldpath.so via LD_PRELOAD ==="
 if LD_PRELOAD="$LIB/clear_ldpath.so" /bin/sh -c 'echo ok' >/dev/null 2>&1; then
   pass "glibc /bin/sh works with LD_PRELOAD=clear_ldpath.so"
 else
@@ -48,42 +60,18 @@ else
 fi
 
 echo ""
-echo "=== 4. glibc child works with LD_LIBRARY_PATH + LD_PRELOAD ==="
-if LD_LIBRARY_PATH="$LIB" LD_PRELOAD="$LIB/clear_ldpath.so" /bin/sh -c 'echo ok' >/dev/null 2>&1; then
-  pass "glibc /bin/sh works with both LD_LIBRARY_PATH and LD_PRELOAD"
-else
-  fail "glibc /bin/sh crashes with both LD_LIBRARY_PATH and LD_PRELOAD"
-fi
-
-echo ""
-echo "=== 5. BUN_BE_BUN=1 launches bun (plugin install path) ==="
+echo "=== 5. BUN_BE_BUN=1 via ELF wrapper launches bun ==="
 BUN_VERSION=$(
-  LD_LIBRARY_PATH="$LIB" LD_PRELOAD="$LIB/clear_ldpath.so" BUN_BE_BUN=1 \
-    "$LIB/opencode" --version 2>&1
+  BUN_BE_BUN=1 "$LIB/opencode" --version 2>&1
 ) || true
 if echo "$BUN_VERSION" | grep -qE '^[0-9]+\.[0-9]+'; then
-  pass "BUN_BE_BUN=1 works: bun $BUN_VERSION"
+  pass "BUN_BE_BUN=1 via ELF wrapper: bun $BUN_VERSION"
 else
-  fail "BUN_BE_BUN=1 failed: $BUN_VERSION"
+  fail "BUN_BE_BUN=1 via ELF wrapper failed: $BUN_VERSION"
 fi
 
 echo ""
-echo "=== 6. LD_LIBRARY_PATH preserved for bun and its children ==="
-cat > /tmp/test_bun_ld.js <<'JSEOF'
-process.stdout.write(process.env.LD_LIBRARY_PATH || "");
-JSEOF
-BUN_LD=$(
-  LD_LIBRARY_PATH="$LIB" LD_PRELOAD="$LIB/clear_ldpath.so" BUN_BE_BUN=1 \
-    "$LIB/opencode" run /tmp/test_bun_ld.js 2>/dev/null
-) || true
-if [ "$BUN_LD" = "$LIB" ]; then
-  pass "LD_LIBRARY_PATH preserved: $BUN_LD"
-else
-  fail "LD_LIBRARY_PATH expected '$LIB', got '$BUN_LD'"
-fi
-
-echo ""
-echo "=== 7. Grandchild glibc processes work ==="
+echo "=== 6. Grandchild glibc processes work (LD_LIBRARY_PATH cleared) ==="
 cat > /tmp/test_grandchild.js <<'JSEOF'
 var cp = require("child_process");
 try {
@@ -94,8 +82,7 @@ try {
 }
 JSEOF
 GRANDCHILD=$(
-  LD_LIBRARY_PATH="$LIB" LD_PRELOAD="$LIB/clear_ldpath.so" BUN_BE_BUN=1 \
-    "$LIB/opencode" run /tmp/test_grandchild.js 2>/dev/null
+  BUN_BE_BUN=1 "$LIB/opencode" run /tmp/test_grandchild.js 2>/dev/null
 ) || true
 if [ "$GRANDCHILD" = "grandchild_ok" ]; then
   pass "grandchild glibc process runs without crashing"
@@ -104,11 +91,34 @@ else
 fi
 
 echo ""
+echo "=== 7. LD_LIBRARY_PATH is cleared in normal path (no BUN_BE_BUN) ==="
+CHILD_LD=$(
+  LD_PRELOAD="$LIB/clear_ldpath.so" LD_LIBRARY_PATH="$LIB" \
+    /bin/sh -c 'printf "%s" "$LD_LIBRARY_PATH"'
+) || true
+if [ -z "$CHILD_LD" ]; then
+  pass "LD_LIBRARY_PATH cleared by clear_ldpath.so (normal path)"
+else
+  fail "LD_LIBRARY_PATH leaked: '$CHILD_LD'"
+fi
+
+echo ""
+echo "=== 7b. LD_LIBRARY_PATH preserved when BUN_BE_BUN=1 ==="
+CHILD_LD_BUN=$(
+  LD_PRELOAD="$LIB/clear_ldpath.so" LD_LIBRARY_PATH="$LIB" BUN_BE_BUN=1 \
+    /bin/sh -c 'printf "%s" "$LD_LIBRARY_PATH"'
+) || true
+if [ "$CHILD_LD_BUN" = "$LIB" ]; then
+  pass "LD_LIBRARY_PATH preserved for BUN_BE_BUN=1 path"
+else
+  fail "LD_LIBRARY_PATH expected '$LIB', got '$CHILD_LD_BUN'"
+fi
+
+echo ""
 echo "=== 8. Plugin install succeeds ==="
 mkdir -p /tmp/testpkg
 echo '{}' > /tmp/testpkg/package.json
-if LD_LIBRARY_PATH="$LIB" LD_PRELOAD="$LIB/clear_ldpath.so" BUN_BE_BUN=1 \
-    "$LIB/opencode" add --cwd /tmp/testpkg opencode-anthropic-auth@0.0.13 >/dev/null 2>&1; then
+if BUN_BE_BUN=1 "$LIB/opencode" add --cwd /tmp/testpkg opencode-anthropic-auth@0.0.13 >/dev/null 2>&1; then
   PKG_COUNT=$(ls /tmp/testpkg/node_modules/ 2>/dev/null | wc -l)
   if [ "$PKG_COUNT" -gt 0 ]; then
     pass "plugin install: $PKG_COUNT packages in node_modules"
@@ -132,8 +142,7 @@ try {
 }
 JSEOF
 REINVOKE=$(
-  LD_LIBRARY_PATH="$LIB" LD_PRELOAD="$LIB/clear_ldpath.so" BUN_BE_BUN=1 \
-    "$LIB/opencode" run /tmp/test_reinvoke.js 2>/dev/null
+  BUN_BE_BUN=1 "$LIB/opencode" run /tmp/test_reinvoke.js 2>/dev/null
 ) || true
 if echo "$REINVOKE" | grep -qE '^[0-9]+\.[0-9]+'; then
   pass "process.execPath re-invocation works: bun $REINVOKE"
@@ -151,13 +160,13 @@ fi
 
 echo ""
 echo "=== 11. opencode.bin wrapper works ==="
-OC_VERSION=$(
+OC_VERSION2=$(
   "$BIN/opencode.bin" --version 2>&1
 ) || true
-if echo "$OC_VERSION" | grep -qE '^[0-9]+\.[0-9]+'; then
-  pass "opencode.bin wrapper works: v$OC_VERSION"
+if echo "$OC_VERSION2" | grep -qE '^[0-9]+\.[0-9]+'; then
+  pass "opencode.bin wrapper works: v$OC_VERSION2"
 else
-  fail "opencode.bin wrapper failed: $OC_VERSION"
+  fail "opencode.bin wrapper failed: $OC_VERSION2"
 fi
 
 echo ""
