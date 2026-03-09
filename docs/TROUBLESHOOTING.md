@@ -103,7 +103,9 @@ is loadable by any libc.
 6. **Current (musl .path file):** `LD_LIBRARY_PATH` eliminated entirely. The musl linker reads
    `/tmp/etc/ld-musl-x86_64.path` to find bundled libs. `clear_ldpath.so` only clears
    `LD_PRELOAD`. Plugin install works because `process.execPath` → `lib/opencode` finds its
-   libs via the `.path` file without any env vars. 12/12 tests pass on all distros.
+   libs via the `.path` file without any env vars. 12/12 tests pass on all Docker distros.
+   **Verified on QNAP NAS (GLIBC 2.21):** all 5 plugins install successfully, node/git/MCP
+   servers work, no `LD_LIBRARY_PATH` or `LD_PRELOAD` leaks to child processes.
 
 ## Known Issues & Gotchas
 
