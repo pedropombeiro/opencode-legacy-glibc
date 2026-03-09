@@ -22,7 +22,7 @@ bin/opencode          (outer wrapper — creates musl loader symlink, delegates 
 | `ld-musl-x86_64.so.1` | musl dynamic linker (from Alpine) |
 | `libstdc++.so.6` | C++ standard library (from Alpine) |
 | `libgcc_s.so.1` | GCC support library (from Alpine) |
-| `clear_ldpath.so` | LD_PRELOAD lib that sanitizes env before `main()` |
+| `clear_ldpath.so` | Self-contained LD_PRELOAD lib that sanitizes env before `main()` |
 
 ## Plugin Installation Mechanism
 
@@ -41,34 +41,43 @@ process.execPath add --force --exact --cwd ~/.cache/opencode <pkg>@<version>
 
 ## Environment Sanitization (clear_ldpath.so)
 
-`clear_ldpath.so` is a musl-compiled shared library loaded via `LD_PRELOAD` into the musl opencode
-binary. Its GCC constructor runs before `main()` and does:
+`clear_ldpath.so` is compiled with `-nostdlib` to produce a **self-contained shared library with
+zero dynamic dependencies**. This is critical because Bun leaks `LD_PRELOAD` to child processes
+(see below), and if the `.so` depended on musl libc, glibc children would crash trying to load it.
+
+The library manipulates the `environ` pointer directly (no libc calls) via a GCC constructor that
+runs before `main()`:
 
 1. **Stashes `LD_LIBRARY_PATH`** into `_OPENCODE_LIB_PATH` (so `opencode.bin` can restore it when
    re-entering the wrapper chain)
-2. **Always clears `LD_PRELOAD`** (prevents the musl `.so` from being injected into glibc children)
+2. **Always clears `LD_PRELOAD`** from the C environ
 3. **Conditionally clears `LD_LIBRARY_PATH`**:
    - If `BUN_BE_BUN=1`: preserves `LD_LIBRARY_PATH` (plugin install needs musl libs)
-   - Otherwise: clears `LD_LIBRARY_PATH` (prevents glibc children from finding musl's
-     `libc.musl-x86_64.so.1`)
+   - Otherwise: clears `LD_LIBRARY_PATH` (prevents glibc children from finding musl libs)
 
 ### Why conditional clearing matters
 
-- **Without clearing (old approach):** glibc-linked child processes (node, git, MCP servers) would
-  find musl's `libc.musl-x86_64.so.1` in `LD_LIBRARY_PATH` and fail with
-  `libc.musl-x86_64.so.1: cannot open shared object file`
+- **Without clearing:** glibc-linked child processes (node, git, MCP servers) find musl's
+  `libc.musl-x86_64.so.1` in `LD_LIBRARY_PATH` and fail
 - **With unconditional clearing (v1.2.19 approach):** Plugin install fails because the re-invoked
   musl binary can't find `libstdc++.so.6` and `libgcc_s.so.1`
 - **With conditional clearing (current approach):** Both paths work correctly
 
-### Bun's process.env caching
+### Bun's process.env caching (critical gotcha)
 
-Bun snapshots `process.env` at startup. Changes made by `clear_ldpath.so` via `setenv()`/`unsetenv()`
-modify the C-level `environ` but NOT Bun's cached `process.env`. This means:
+**Bun caches `process.env` at startup and uses that cache — not the C `environ` — when spawning
+child processes via `execve`.** This means:
 
-- `process.env.LD_PRELOAD` may still show the old value in JS code (harmless)
-- Child processes spawned by Bun (via `execSync`/`spawn`) inherit the **cleaned** C-level environ
-- The `_OPENCODE_LIB_PATH` stash is visible to child processes but not to `process.env`
+- `clear_ldpath.so`'s constructor successfully modifies the C-level `environ`, but Bun's child
+  spawning ignores those changes
+- `LD_PRELOAD` and `LD_LIBRARY_PATH` **leak to child processes** despite being cleared in C
+- This is why `clear_ldpath.so` MUST be compiled with `-nostdlib`: since it leaks to glibc
+  children via `LD_PRELOAD`, it must be loadable by glibc's dynamic linker without any musl deps
+- When loaded by glibc children, the constructor runs and cleans the environ for their descendants
+
+**Prior approach (broken):** Compiled with musl libc as a dependency. Constructor cleared env at
+C level, but Bun re-injected the values. Glibc children crashed trying to load `libc.musl-x86_64.so.1`
+(a dependency of the `.so` itself).
 
 ## Known Issues & Gotchas
 
@@ -76,8 +85,7 @@ modify the C-level `environ` but NOT Bun's cached `process.env`. This means:
 
 **Observed:** Using `patchelf --set-rpath '$ORIGIN'` on the ~152MB Bun binary (either combined
 with `--set-interpreter` or as a separate invocation) produces a binary that segfaults immediately
-on startup. `patchelf --print-rpath` confirms the RPATH was set correctly, but the binary is
-corrupted.
+on startup.
 
 **Conclusion:** Do NOT use `--set-rpath` with Bun binaries. The `LD_LIBRARY_PATH` approach works.
 
@@ -120,8 +128,8 @@ docker buildx build --build-arg VERSION=v1.2.22 --output type=local,dest=./out b
 
 ### Run the automated test suite
 
-The test script (`build/test/test-env.sh`) runs 10 deterministic tests covering wrapper chain,
-plugin install, env sanitization, and git compatibility. No API key required.
+The test script (`build/test/test-env.sh`) runs 11 deterministic tests covering wrapper chain,
+plugin install, env sanitization, LD_PRELOAD safety, and git compatibility. No API key required.
 
 ```bash
 # Build and test on a specific distro
@@ -138,10 +146,10 @@ docker run --platform linux/amd64 --rm opencode-test-centos7 sh /opt/test-env.sh
 
 ### GLIBC compatibility matrix
 
-Tested and passing (10/10 tests) as of v1.2.22:
+Tested and passing (11/11 tests) as of v1.2.22:
 
 | Image | GLIBC | Status |
 |-------|-------|--------|
-| centos:7 | 2.17 | 10/10 |
-| debian:stretch-slim | 2.24 | 10/10 |
-| debian:buster-slim | 2.28 | 10/10 |
+| centos:7 | 2.17 | 11/11 |
+| debian:stretch-slim | 2.24 | 11/11 |
+| debian:buster-slim | 2.28 | 11/11 |

@@ -27,12 +27,15 @@ COPY opencode /opencode/bin/opencode
 COPY opencode.bin /opencode/bin/opencode.bin
 RUN chmod +x /opencode/bin/opencode /opencode/bin/opencode.bin
 
-# Build a small shared library that clears LD_PRELOAD
-# This prevents clear_ldpath.so from being injected into glibc-linked child processes
+# Build a self-contained shared library with no dynamic dependencies.
+# Uses -nostdlib so the .so doesn't link against musl libc. This is critical
+# because Bun leaks LD_PRELOAD to child processes, and glibc children would
+# crash trying to load a musl-dependent .so.
 FROM --platform=$BUILD_PLATFORM alpine:latest AS ldpreload
 RUN apk add --no-cache gcc musl-dev
 COPY clear_ldpath.c /tmp/
-RUN mkdir -p /opencode/lib && gcc -shared -fPIC -o /opencode/lib/clear_ldpath.so /tmp/clear_ldpath.c
+RUN mkdir -p /opencode/lib && gcc -shared -fPIC -nostdlib \
+    -o /opencode/lib/clear_ldpath.so /tmp/clear_ldpath.c
 
 FROM scratch AS export
 COPY --from=builder /build/packages/opencode/dist/opencode-linux-x64-baseline-musl/bin/opencode /opencode/lib/opencode

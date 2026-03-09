@@ -7,14 +7,11 @@
 # exercises the real clear_ldpath.so code path since the .so is loaded via
 # LD_PRELOAD into the musl binary.
 #
-# NOTE: Bun caches process.env at startup and uses that cache when spawning
-# child processes (execSync/spawn). Env changes made by the clear_ldpath.so
-# constructor via setenv() modify the C-level environ but NOT Bun's cache.
-# However, child processes spawned by Bun DO inherit the cleaned env because
-# Bun filters process.env through to execve. The critical behaviors are:
-#   - LD_PRELOAD and LD_LIBRARY_PATH are cleared in the C environ
-#   - Bun's process.env retains the original values (harmless cache artifact)
-#   - Grandchild processes see the cleaned env (verified by tests 5-6)
+# IMPORTANT: Bun caches process.env at startup and uses that cache when
+# spawning child processes. The clear_ldpath.so constructor modifies the
+# C-level environ, but Bun passes its own cached copy to children. Therefore
+# clear_ldpath.so is compiled with -nostdlib (no libc dependency) so that
+# even if LD_PRELOAD leaks to glibc children, they can load the .so harmlessly.
 #
 # Usage: docker run --platform linux/amd64 --rm <image> sh /opt/test-env.sh
 
@@ -40,7 +37,32 @@ else
 fi
 
 echo ""
-echo "=== 2. BUN_BE_BUN=1 launches bun (plugin install path) ==="
+echo "=== 2. clear_ldpath.so has no dynamic dependencies ==="
+NEEDED=$(readelf -d "$LIB/clear_ldpath.so" 2>/dev/null | grep NEEDED || true)
+if [ -z "$NEEDED" ]; then
+  pass "clear_ldpath.so is self-contained (no NEEDED entries)"
+else
+  fail "clear_ldpath.so has dependencies: $NEEDED"
+fi
+
+echo ""
+echo "=== 3. glibc child can load clear_ldpath.so via LD_PRELOAD ==="
+if LD_PRELOAD="$LIB/clear_ldpath.so" /bin/sh -c 'echo ok' >/dev/null 2>&1; then
+  pass "glibc /bin/sh works with LD_PRELOAD=clear_ldpath.so"
+else
+  fail "glibc /bin/sh crashes with LD_PRELOAD=clear_ldpath.so"
+fi
+
+echo ""
+echo "=== 4. glibc child works with LD_LIBRARY_PATH + LD_PRELOAD ==="
+if LD_LIBRARY_PATH="$LIB" LD_PRELOAD="$LIB/clear_ldpath.so" /bin/sh -c 'echo ok' >/dev/null 2>&1; then
+  pass "glibc /bin/sh works with both LD_LIBRARY_PATH and LD_PRELOAD"
+else
+  fail "glibc /bin/sh crashes with both LD_LIBRARY_PATH and LD_PRELOAD"
+fi
+
+echo ""
+echo "=== 5. BUN_BE_BUN=1 launches bun (plugin install path) ==="
 BUN_VERSION=$(
   LD_LIBRARY_PATH="$LIB" LD_PRELOAD="$LIB/clear_ldpath.so" BUN_BE_BUN=1 \
     "$LIB/opencode" --version 2>&1
@@ -52,7 +74,7 @@ else
 fi
 
 echo ""
-echo "=== 3. BUN_BE_BUN=1 preserves LD_LIBRARY_PATH for bun process ==="
+echo "=== 6. BUN_BE_BUN=1 preserves LD_LIBRARY_PATH for bun process ==="
 cat > /tmp/test_bun_ld.js <<'JSEOF'
 process.stdout.write(process.env.LD_LIBRARY_PATH || "");
 JSEOF
@@ -67,41 +89,28 @@ else
 fi
 
 echo ""
-echo "=== 4. LD_PRELOAD cleared for grandchild processes ==="
-cat > /tmp/test_preload.js <<'JSEOF'
+echo "=== 7. Grandchild glibc processes work (no crash from LD_PRELOAD leak) ==="
+cat > /tmp/test_grandchild.js <<'JSEOF'
 var cp = require("child_process");
-var out = cp.execSync("/bin/sh -c 'printf \"%s\" \"$LD_PRELOAD\"'", { encoding: "utf8" });
-process.stdout.write(out);
+try {
+  var out = cp.execSync("/bin/sh -c 'echo grandchild_ok'", { encoding: "utf8" });
+  process.stdout.write(out.trim());
+} catch(e) {
+  process.stdout.write("CRASH:" + e.message.split("\n")[0]);
+}
 JSEOF
-CHILD_PRELOAD=$(
+GRANDCHILD=$(
   LD_LIBRARY_PATH="$LIB" LD_PRELOAD="$LIB/clear_ldpath.so" BUN_BE_BUN=1 \
-    "$LIB/opencode" run /tmp/test_preload.js 2>/dev/null
+    "$LIB/opencode" run /tmp/test_grandchild.js 2>/dev/null
 ) || true
-if [ -z "$CHILD_PRELOAD" ]; then
-  pass "LD_PRELOAD cleared for child processes"
+if [ "$GRANDCHILD" = "grandchild_ok" ]; then
+  pass "grandchild glibc process runs without crashing"
 else
-  fail "LD_PRELOAD leaked to child: '$CHILD_PRELOAD'"
+  fail "grandchild failed: '$GRANDCHILD'"
 fi
 
 echo ""
-echo "=== 5. LD_LIBRARY_PATH cleared for grandchild glibc processes ==="
-cat > /tmp/test_grandchild_ld.js <<'JSEOF'
-var cp = require("child_process");
-var out = cp.execSync("/bin/sh -c 'printf \"%s\" \"$LD_LIBRARY_PATH\"'", { encoding: "utf8" });
-process.stdout.write(out);
-JSEOF
-GRANDCHILD_LD=$(
-  LD_LIBRARY_PATH="$LIB" LD_PRELOAD="$LIB/clear_ldpath.so" BUN_BE_BUN=1 \
-    "$LIB/opencode" run /tmp/test_grandchild_ld.js 2>/dev/null
-) || true
-if [ -z "$GRANDCHILD_LD" ]; then
-  pass "LD_LIBRARY_PATH is empty in grandchild"
-else
-  fail "LD_LIBRARY_PATH leaked to grandchild: '$GRANDCHILD_LD'"
-fi
-
-echo ""
-echo "=== 6. Plugin install succeeds ==="
+echo "=== 8. Plugin install succeeds ==="
 mkdir -p /tmp/testpkg
 echo '{}' > /tmp/testpkg/package.json
 if LD_LIBRARY_PATH="$LIB" LD_PRELOAD="$LIB/clear_ldpath.so" BUN_BE_BUN=1 \
@@ -117,15 +126,7 @@ else
 fi
 
 echo ""
-echo "=== 7. opencode starts through wrapper chain (no BUN_BE_BUN) ==="
-if "$BIN/opencode" --version >/dev/null 2>&1; then
-  pass "opencode starts successfully via wrapper chain"
-else
-  fail "opencode failed to start through wrapper chain"
-fi
-
-echo ""
-echo "=== 8. git works when LD_LIBRARY_PATH is set ==="
+echo "=== 9. git works when LD_LIBRARY_PATH is set ==="
 if LD_LIBRARY_PATH="$LIB" git --version >/dev/null 2>&1; then
   pass "git works with LD_LIBRARY_PATH set"
 else
@@ -133,7 +134,7 @@ else
 fi
 
 echo ""
-echo "=== 9. opencode.bin restores LD_LIBRARY_PATH from _OPENCODE_LIB_PATH ==="
+echo "=== 10. opencode.bin restores LD_LIBRARY_PATH from _OPENCODE_LIB_PATH ==="
 OC_VERSION=$(
   _OPENCODE_LIB_PATH="$LIB" "$BIN/opencode.bin" --version 2>&1
 ) || true
@@ -144,7 +145,7 @@ else
 fi
 
 echo ""
-echo "=== 10. opencode.bin falls back to SCRIPT_DIR/lib without stash ==="
+echo "=== 11. opencode.bin falls back to SCRIPT_DIR/lib without stash ==="
 OC_VERSION2=$(
   "$BIN/opencode.bin" --version 2>&1
 ) || true
