@@ -3,15 +3,9 @@
 # interaction. Runs inside a test container with the legacy-glibc opencode build.
 # No LLM API key required.
 #
-# Tests use BUN_BE_BUN=1 to access bun runtime for JS execution. This also
-# exercises the real clear_ldpath.so code path since the .so is loaded via
-# LD_PRELOAD into the musl binary.
-#
-# IMPORTANT: Bun caches process.env at startup and uses that cache when
-# spawning child processes. The clear_ldpath.so constructor modifies the
-# C-level environ, but Bun passes its own cached copy to children. Therefore
-# clear_ldpath.so is compiled with -nostdlib (no libc dependency) so that
-# even if LD_PRELOAD leaks to glibc children, they can load the .so harmlessly.
+# clear_ldpath.so is compiled with -nostdlib (no libc dependency). It only
+# clears LD_PRELOAD from the environ. LD_LIBRARY_PATH is intentionally kept:
+# it's harmless to glibc children and needed by process.execPath re-invocations.
 #
 # Usage: docker run --platform linux/amd64 --rm <image> sh /opt/test-env.sh
 
@@ -74,7 +68,7 @@ else
 fi
 
 echo ""
-echo "=== 6. BUN_BE_BUN=1 preserves LD_LIBRARY_PATH for bun process ==="
+echo "=== 6. LD_LIBRARY_PATH preserved for bun and its children ==="
 cat > /tmp/test_bun_ld.js <<'JSEOF'
 process.stdout.write(process.env.LD_LIBRARY_PATH || "");
 JSEOF
@@ -83,13 +77,13 @@ BUN_LD=$(
     "$LIB/opencode" run /tmp/test_bun_ld.js 2>/dev/null
 ) || true
 if [ "$BUN_LD" = "$LIB" ]; then
-  pass "LD_LIBRARY_PATH preserved with BUN_BE_BUN=1: $BUN_LD"
+  pass "LD_LIBRARY_PATH preserved: $BUN_LD"
 else
-  fail "LD_LIBRARY_PATH expected '$LIB' with BUN_BE_BUN=1, got '$BUN_LD'"
+  fail "LD_LIBRARY_PATH expected '$LIB', got '$BUN_LD'"
 fi
 
 echo ""
-echo "=== 7. Grandchild glibc processes work (no crash from LD_PRELOAD leak) ==="
+echo "=== 7. Grandchild glibc processes work ==="
 cat > /tmp/test_grandchild.js <<'JSEOF'
 var cp = require("child_process");
 try {
@@ -126,7 +120,29 @@ else
 fi
 
 echo ""
-echo "=== 9. git works when LD_LIBRARY_PATH is set ==="
+echo "=== 9. Plugin re-invocation via process.execPath works ==="
+cat > /tmp/test_reinvoke.js <<'JSEOF'
+var cp = require("child_process");
+try {
+  var env = Object.assign({}, process.env, { BUN_BE_BUN: "1" });
+  var out = cp.execSync(process.execPath + " --version", { encoding: "utf8", env: env });
+  process.stdout.write(out.trim());
+} catch(e) {
+  process.stdout.write("FAIL:" + (e.status || "") + ":" + e.message.split("\n")[0]);
+}
+JSEOF
+REINVOKE=$(
+  LD_LIBRARY_PATH="$LIB" LD_PRELOAD="$LIB/clear_ldpath.so" BUN_BE_BUN=1 \
+    "$LIB/opencode" run /tmp/test_reinvoke.js 2>/dev/null
+) || true
+if echo "$REINVOKE" | grep -qE '^[0-9]+\.[0-9]+'; then
+  pass "process.execPath re-invocation works: bun $REINVOKE"
+else
+  fail "process.execPath re-invocation failed: '$REINVOKE'"
+fi
+
+echo ""
+echo "=== 10. git works when LD_LIBRARY_PATH is set ==="
 if LD_LIBRARY_PATH="$LIB" git --version >/dev/null 2>&1; then
   pass "git works with LD_LIBRARY_PATH set"
 else
@@ -134,25 +150,14 @@ else
 fi
 
 echo ""
-echo "=== 10. opencode.bin restores LD_LIBRARY_PATH from _OPENCODE_LIB_PATH ==="
+echo "=== 11. opencode.bin wrapper works ==="
 OC_VERSION=$(
-  _OPENCODE_LIB_PATH="$LIB" "$BIN/opencode.bin" --version 2>&1
-) || true
-if echo "$OC_VERSION" | grep -qE '^[0-9]+\.[0-9]+'; then
-  pass "opencode.bin restores lib path: v$OC_VERSION"
-else
-  fail "opencode.bin with _OPENCODE_LIB_PATH failed: $OC_VERSION"
-fi
-
-echo ""
-echo "=== 11. opencode.bin falls back to SCRIPT_DIR/lib without stash ==="
-OC_VERSION2=$(
   "$BIN/opencode.bin" --version 2>&1
 ) || true
-if echo "$OC_VERSION2" | grep -qE '^[0-9]+\.[0-9]+'; then
-  pass "opencode.bin works without _OPENCODE_LIB_PATH: v$OC_VERSION2"
+if echo "$OC_VERSION" | grep -qE '^[0-9]+\.[0-9]+'; then
+  pass "opencode.bin wrapper works: v$OC_VERSION"
 else
-  fail "opencode.bin without _OPENCODE_LIB_PATH failed: $OC_VERSION2"
+  fail "opencode.bin wrapper failed: $OC_VERSION"
 fi
 
 echo ""
