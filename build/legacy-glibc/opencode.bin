@@ -2,10 +2,12 @@
 # Inner wrapper for opencode - invoked both by the user-facing wrapper and
 # by opencode itself (process.execPath) for plugin installation.
 # Sets LD_LIBRARY_PATH so the musl dynamic linker can find bundled libs,
-# and LD_PRELOAD to clear LD_PRELOAD itself before child processes run.
+# and LD_PRELOAD to load clear_ldpath.so which sanitizes the env for
+# child processes (clears LD_PRELOAD and stashes/clears LD_LIBRARY_PATH).
 
 SCRIPT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+LIB_PATH="${_OPENCODE_LIB_PATH:-${SCRIPT_DIR}/lib}"
 
 LD_PRELOAD="${SCRIPT_DIR}/lib/clear_ldpath.so" \
-    LD_LIBRARY_PATH="${SCRIPT_DIR}/lib" \
+    LD_LIBRARY_PATH="${LIB_PATH}" \
     exec "${SCRIPT_DIR}/lib/opencode" "$@"

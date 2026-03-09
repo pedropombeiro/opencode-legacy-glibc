@@ -22,7 +22,7 @@ bin/opencode          (outer wrapper — creates musl loader symlink, delegates 
 | `ld-musl-x86_64.so.1` | musl dynamic linker (from Alpine) |
 | `libstdc++.so.6` | C++ standard library (from Alpine) |
 | `libgcc_s.so.1` | GCC support library (from Alpine) |
-| `clear_ldpath.so` | LD_PRELOAD lib that unsets `LD_PRELOAD` before `main()` |
+| `clear_ldpath.so` | LD_PRELOAD lib that sanitizes env before `main()` |
 
 ## Plugin Installation Mechanism
 
@@ -39,44 +39,49 @@ process.execPath add --force --exact --cwd ~/.cache/opencode <pkg>@<version>
 - `OPENCODE_DISABLE_DEFAULT_PLUGINS=true` skips built-in npm plugins (currently just
   `opencode-anthropic-auth`).
 
+## Environment Sanitization (clear_ldpath.so)
+
+`clear_ldpath.so` is a musl-compiled shared library loaded via `LD_PRELOAD` into the musl opencode
+binary. Its GCC constructor runs before `main()` and does:
+
+1. **Stashes `LD_LIBRARY_PATH`** into `_OPENCODE_LIB_PATH` (so `opencode.bin` can restore it when
+   re-entering the wrapper chain)
+2. **Always clears `LD_PRELOAD`** (prevents the musl `.so` from being injected into glibc children)
+3. **Conditionally clears `LD_LIBRARY_PATH`**:
+   - If `BUN_BE_BUN=1`: preserves `LD_LIBRARY_PATH` (plugin install needs musl libs)
+   - Otherwise: clears `LD_LIBRARY_PATH` (prevents glibc children from finding musl's
+     `libc.musl-x86_64.so.1`)
+
+### Why conditional clearing matters
+
+- **Without clearing (old approach):** glibc-linked child processes (node, git, MCP servers) would
+  find musl's `libc.musl-x86_64.so.1` in `LD_LIBRARY_PATH` and fail with
+  `libc.musl-x86_64.so.1: cannot open shared object file`
+- **With unconditional clearing (v1.2.19 approach):** Plugin install fails because the re-invoked
+  musl binary can't find `libstdc++.so.6` and `libgcc_s.so.1`
+- **With conditional clearing (current approach):** Both paths work correctly
+
+### Bun's process.env caching
+
+Bun snapshots `process.env` at startup. Changes made by `clear_ldpath.so` via `setenv()`/`unsetenv()`
+modify the C-level `environ` but NOT Bun's cached `process.env`. This means:
+
+- `process.env.LD_PRELOAD` may still show the old value in JS code (harmless)
+- Child processes spawned by Bun (via `execSync`/`spawn`) inherit the **cleaned** C-level environ
+- The `_OPENCODE_LIB_PATH` stash is visible to child processes but not to `process.env`
+
 ## Known Issues & Gotchas
 
-### 1. Plugin install fails silently when LD_LIBRARY_PATH is cleared
-
-**Root cause:** The original `clear_ldpath.c` stripped both `LD_LIBRARY_PATH` and `LD_PRELOAD` via
-a GCC constructor (runs before `main()`). When OpenCode re-invokes itself via `process.execPath`
-for plugin installation, the child process is the raw ELF binary (`lib/opencode`) — not
-`opencode.bin`. Without `LD_LIBRARY_PATH`, the musl linker can't find `libstdc++.so.6` and
-`libgcc_s.so.1`, and the child process fails with:
-
-```
-Error loading shared library libstdc++.so.6: No such file or directory
-Error loading shared library libgcc_s.so.1: No such file or directory
-```
-
-**Fix:** Only clear `LD_PRELOAD` in `clear_ldpath.c`, preserve `LD_LIBRARY_PATH`. The musl lib
-paths in `LD_LIBRARY_PATH` are harmless to glibc child processes (like `git`) because glibc's
-linker uses different sonames and won't pick up musl-specific libs. This was confirmed via Docker
-testing: `LD_LIBRARY_PATH=/opt/opencode/lib git --version` works correctly.
-
-With `LD_LIBRARY_PATH` preserved:
-1. `opencode.bin` sets `LD_LIBRARY_PATH` and `LD_PRELOAD`
-2. `clear_ldpath.c` clears only `LD_PRELOAD` (so `clear_ldpath.so` isn't injected into children)
-3. `LD_LIBRARY_PATH` is inherited by child processes
-4. `process.execPath` re-invocations find `libstdc++.so.6` and `libgcc_s.so.1` via the
-   inherited `LD_LIBRARY_PATH`
-
-### 2. patchelf --set-rpath causes segfaults on Bun binaries
+### 1. patchelf --set-rpath causes segfaults on Bun binaries
 
 **Observed:** Using `patchelf --set-rpath '$ORIGIN'` on the ~152MB Bun binary (either combined
 with `--set-interpreter` or as a separate invocation) produces a binary that segfaults immediately
 on startup. `patchelf --print-rpath` confirms the RPATH was set correctly, but the binary is
 corrupted.
 
-**Conclusion:** Do NOT use `--set-rpath` with Bun binaries. The `LD_LIBRARY_PATH` preservation
-approach is simpler and works correctly.
+**Conclusion:** Do NOT use `--set-rpath` with Bun binaries. The `LD_LIBRARY_PATH` approach works.
 
-### 3. Docker testing requires `--platform linux/amd64`
+### 2. Docker testing requires `--platform linux/amd64`
 
 The build targets x86_64 (QNAP NAS). On Apple Silicon (arm64) hosts, Docker containers must use
 `--platform linux/amd64` for the test container, otherwise:
@@ -84,15 +89,15 @@ The build targets x86_64 (QNAP NAS). On Apple Silicon (arm64) hosts, Docker cont
   but are actually architecture mismatch errors
 - The x86_64 musl binary won't run under arm64 emulation without proper multiarch setup
 
-### 4. debian:stretch repos are archived
+### 3. Archived Debian/CentOS repos
 
-Debian Stretch (GLIBC 2.24, good test proxy for QNAP's 2.21) repos have moved to
-`archive.debian.org`. The test Dockerfile must:
-- Replace `deb.debian.org` with `archive.debian.org`
-- Remove `stretch-updates` entries (404s even on archive)
-- Set `Acquire::Check-Valid-Until "false"`
+- **Debian Stretch** (GLIBC 2.24): repos moved to `archive.debian.org`, `stretch-updates` removed
+- **Debian Buster** (GLIBC 2.28): repos moved to `archive.debian.org`, `buster-updates` removed
+- **CentOS 7** (GLIBC 2.17): repos moved to `vault.centos.org`
 
-### 5. The two-wrapper design exists for a reason
+All test Dockerfiles include the necessary repo fixes.
+
+### 4. The two-wrapper design exists for a reason
 
 The outer wrapper (`bin/opencode`) creates the musl loader symlink at
 `/tmp/.opencode-ld/ld-musl-x86_64.so.1`. This is needed because the binary's ELF interpreter is
@@ -102,17 +107,10 @@ hardcoded to that path via `patchelf --set-interpreter`. The symlink must point 
 The inner wrapper (`bin/opencode.bin`) exists because OpenCode uses `process.execPath` for
 self-re-execution during plugin installation. Since `process.execPath` resolves to the raw binary
 (`lib/opencode`), not the wrappers, the env vars set by `opencode.bin` must be inherited rather
-than re-set by a wrapper.
+than re-set by a wrapper. `opencode.bin` also restores `LD_LIBRARY_PATH` from `_OPENCODE_LIB_PATH`
+if available (set by `clear_ldpath.so`), falling back to `$SCRIPT_DIR/lib`.
 
-### 6. clear_ldpath.so must still clear LD_PRELOAD
-
-Even though `LD_LIBRARY_PATH` is now preserved, `LD_PRELOAD` must still be cleared. If
-`clear_ldpath.so` (a musl-compiled shared library) were inherited by glibc-linked child processes,
-the glibc dynamic linker would attempt to load it, potentially causing ABI incompatibilities or
-crashes. By clearing `LD_PRELOAD` in the constructor, the library removes itself from the
-environment before any child process is spawned.
-
-## Testing in Docker
+## Testing
 
 ### Build the artifact
 
@@ -120,59 +118,30 @@ environment before any child process is spawned.
 docker buildx build --build-arg VERSION=v1.2.22 --output type=local,dest=./out build/legacy-glibc
 ```
 
-### Build and run the test container
+### Run the automated test suite
+
+The test script (`build/test/test-env.sh`) runs 10 deterministic tests covering wrapper chain,
+plugin install, env sanitization, and git compatibility. No API key required.
 
 ```bash
-docker build --platform linux/amd64 -t opencode-legacy-test -f build/test/Dockerfile .
-docker run --platform linux/amd64 --rm opencode-legacy-test sh -c '
-  /opt/opencode/bin/opencode --version
-'
+# Build and test on a specific distro
+docker build --platform linux/amd64 -t opencode-test -f build/test/Dockerfile .
+docker run --platform linux/amd64 --rm opencode-test sh /opt/test-env.sh
+
+# Test on other distros
+docker build --platform linux/amd64 -t opencode-test-buster -f build/test/Dockerfile.buster .
+docker run --platform linux/amd64 --rm opencode-test-buster sh /opt/test-env.sh
+
+docker build --platform linux/amd64 -t opencode-test-centos7 -f build/test/Dockerfile.centos7 .
+docker run --platform linux/amd64 --rm opencode-test-centos7 sh /opt/test-env.sh
 ```
 
-### Simulate plugin install (the critical test)
+### GLIBC compatibility matrix
 
-The key test is that `LD_LIBRARY_PATH` survives through the wrapper chain into child processes:
+Tested and passing (10/10 tests) as of v1.2.22:
 
-```bash
-docker run --platform linux/amd64 --rm opencode-legacy-test sh -c '
-  # Set up the full environment as the wrappers do
-  mkdir -p /tmp/.opencode-ld
-  ln -sf /opt/opencode/lib/ld-musl-x86_64.so.1 /tmp/.opencode-ld/ld-musl-x86_64.so.1
-
-  # Simulate process.execPath plugin install (with inherited LD_LIBRARY_PATH)
-  LD_LIBRARY_PATH=/opt/opencode/lib LD_PRELOAD=/opt/opencode/lib/clear_ldpath.so \
-    BUN_BE_BUN=1 /opt/opencode/lib/opencode --version
-
-  # Full plugin install test
-  mkdir -p /tmp/testpkg && echo "{}" > /tmp/testpkg/package.json
-  LD_LIBRARY_PATH=/opt/opencode/lib LD_PRELOAD=/opt/opencode/lib/clear_ldpath.so \
-    BUN_BE_BUN=1 /opt/opencode/lib/opencode add --cwd /tmp/testpkg opencode-anthropic-auth@0.0.13
-  ls /tmp/testpkg/node_modules/
-'
-```
-
-### Verify child processes work
-
-```bash
-docker run --platform linux/amd64 --rm opencode-legacy-test sh -c '
-  /opt/opencode/bin/opencode --version > /dev/null 2>&1
-  git --version  # Should use system git, not musl-linked
-'
-```
-
-### Test across multiple GLIBC versions
-
-Additional test Dockerfiles are provided for broader coverage:
-- `build/test/Dockerfile` — Debian Stretch (GLIBC 2.24)
-- `build/test/Dockerfile.buster` — Debian Buster (GLIBC 2.28)
-- `build/test/Dockerfile.centos7` — CentOS 7 (GLIBC 2.17)
-
-Tested and passing (as of v1.2.22):
-
-| Image | GLIBC | Wrapper | Plugin Install | git |
-|-------|-------|---------|---------------|-----|
-| centos:7 | 2.17 | OK | OK | OK |
-| debian:stretch-slim | 2.24 | OK | OK | OK |
-| debian:buster-slim | 2.28 | OK | OK | OK |
-| ubuntu:20.04 | 2.31 | OK | OK | OK |
-| debian:bookworm-slim | 2.36 | OK | OK | OK |
+| Image | GLIBC | Status |
+|-------|-------|--------|
+| centos:7 | 2.17 | 10/10 |
+| debian:stretch-slim | 2.24 | 10/10 |
+| debian:buster-slim | 2.28 | 10/10 |

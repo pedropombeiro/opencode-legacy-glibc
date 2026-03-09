@@ -11,6 +11,7 @@ RUN sed -i 's|deb.debian.org/debian|archive.debian.org/debian|g' /etc/apt/source
 
 ARG OPENCODE_DIR=out
 COPY ${OPENCODE_DIR}/opencode /opt/opencode
+COPY build/test/test-env.sh /opt/test-env.sh
 
 ENV PATH="/opt/opencode/bin:${PATH}"
 
