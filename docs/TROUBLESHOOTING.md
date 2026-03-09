@@ -9,32 +9,52 @@ bundled **musl libc** libraries.
 ### Wrapper chain
 
 ```
-bin/opencode            (outer wrapper — creates musl loader symlink, delegates to opencode.bin)
-  └─ bin/opencode.bin   (inner wrapper — sets LD_LIBRARY_PATH + LD_PRELOAD, exec's real binary)
-       └─ lib/opencode.bin  (patched ELF binary using musl dynamic linker)
+bin/opencode            (outer wrapper — creates musl loader symlink + .path file)
+  └─ bin/opencode.bin   (inner wrapper — sets LD_PRELOAD=clear_ldpath.so, exec's real binary)
+       └─ lib/opencode  (patched ELF binary using musl dynamic linker)
 ```
 
 When opencode re-invokes itself via `process.execPath` (plugin install):
 
 ```
-lib/opencode            (static ELF wrapper — re-establishes LD_LIBRARY_PATH + LD_PRELOAD)
-  └─ lib/opencode.bin   (patched ELF binary)
+lib/opencode            (called directly — musl linker finds libs via .path file)
 ```
 
-`lib/opencode.elf` is a symlink to `lib/opencode` so that `process.execPath` resolves to the
-ELF wrapper rather than the raw binary.
+No wrapper or `LD_LIBRARY_PATH` needed for re-invocation. The musl linker reads
+`/tmp/etc/ld-musl-x86_64.path` to find bundled libs.
 
-### Key files in `lib/`
+### Key files
 
 | File | Purpose |
 |------|---------|
-| `opencode` | Static ELF wrapper (~245KB, musl) — sets env and exec's `opencode.bin` |
-| `opencode.elf` | Symlink to `opencode` — target for `process.execPath` resolution |
-| `opencode.bin` | Patched OpenCode ELF binary (~152MB, musl dynamic linker) |
-| `ld-musl-x86_64.so.1` | musl dynamic linker (from Alpine) |
-| `libstdc++.so.6` | C++ standard library (from Alpine, musl-compiled) |
-| `libgcc_s.so.1` | GCC support library (from Alpine, musl-compiled) |
-| `clear_ldpath.so` | Self-contained LD_PRELOAD lib (~14KB, no deps) |
+| `bin/opencode` | Outer shell wrapper — creates musl loader symlink + `.path` file |
+| `bin/opencode.bin` | Inner shell wrapper — sets `LD_PRELOAD`, exec's real binary |
+| `lib/opencode` | Patched OpenCode ELF binary (~152MB, musl dynamic linker) |
+| `lib/ld-musl-x86_64.so.1` | musl dynamic linker (from Alpine) |
+| `lib/libstdc++.so.6` | C++ standard library (from Alpine, musl-compiled) |
+| `lib/libgcc_s.so.1` | GCC support library (from Alpine, musl-compiled) |
+| `lib/clear_ldpath.so` | Self-contained LD_PRELOAD lib (~14KB, no deps) |
+
+### Runtime files (created by bin/opencode at startup)
+
+| File | Purpose |
+|------|---------|
+| `/tmp/.opencode-ld/ld-musl-x86_64.so.1` | Symlink to `lib/ld-musl-x86_64.so.1` (ELF interpreter target) |
+| `/tmp/etc/ld-musl-x86_64.path` | Contains `lib/` absolute path (musl library search path) |
+
+## How musl Finds Libraries (the .path file)
+
+The musl dynamic linker resolves its `.path` file relative to its **grandparent directory**
+(second-to-last `/` in its own path). Since the ELF interpreter is patched to
+`/tmp/.opencode-ld/ld-musl-x86_64.so.1`, the grandparent is `/tmp`, so the linker reads
+`/tmp/etc/ld-musl-x86_64.path`.
+
+This is a **musl-specific mechanism invisible to glibc**. Glibc children never read this file
+and are completely unaffected. This eliminates the `LD_LIBRARY_PATH` catch-22 entirely.
+
+**Important**: the `.path` file location depends on the **symlink path**, not the resolved
+target. musl uses `ldso.name` (from the kernel's auxiliary vector), which retains the
+PT_INTERP path.
 
 ## Plugin Installation Mechanism
 
@@ -44,31 +64,19 @@ OpenCode installs plugins (npm packages) by re-invoking itself with `BUN_BE_BUN=
 process.execPath add --force --exact --cwd ~/.cache/opencode <pkg>@<version>
 ```
 
-- `process.execPath` resolves to `lib/opencode` (the **ELF wrapper**), thanks to the
-  `opencode.elf` symlink. This ensures re-invocations go through the wrapper which
-  re-establishes `LD_LIBRARY_PATH` and `LD_PRELOAD`.
+- `process.execPath` resolves via `/proc/self/exe` to `lib/opencode` — the **real binary**.
+  Bun uses `/proc/self/exe` on Linux; there is no env var to override it.
+- The re-invoked binary finds its musl libs via the `.path` file — no `LD_LIBRARY_PATH` needed.
 - `BUN_BE_BUN=1` tells the compiled Bun binary to act as the `bun` CLI instead of running the app.
-- There is no config to point to a custom bun binary; `process.execPath` is hardcoded.
-- `OPENCODE_DISABLE_DEFAULT_PLUGINS=true` skips built-in npm plugins (currently just
-  `opencode-anthropic-auth`).
+- `OPENCODE_DISABLE_DEFAULT_PLUGINS=true` skips built-in npm plugins.
 
 ## Environment Sanitization (clear_ldpath.so)
 
 `clear_ldpath.so` is compiled with `-nostdlib` to produce a **self-contained shared library with
-zero dynamic dependencies**. It clears `LD_PRELOAD` (always) and `LD_LIBRARY_PATH` (conditionally)
-from the C `environ` before `main()` runs.
+zero dynamic dependencies**. Its only job is to clear `LD_PRELOAD` from the environment so the
+`.so` doesn't propagate to child processes.
 
-### What gets cleared and when
-
-| Variable | Normal path (no BUN_BE_BUN) | Plugin install (BUN_BE_BUN=1) |
-|----------|----------------------------|-------------------------------|
-| `LD_PRELOAD` | Cleared | Cleared |
-| `LD_LIBRARY_PATH` | Cleared | **Preserved** |
-
-- **Normal path:** Both are cleared. Glibc children (git, MCP servers, node) get a clean
-  environment with no musl lib paths.
-- **Plugin install path:** `LD_LIBRARY_PATH` is preserved so the re-invoked bun binary can find
-  its musl libs. `LD_PRELOAD` is still cleared (the ELF wrapper re-establishes it before exec).
+`LD_LIBRARY_PATH` is **never set** — the musl linker uses the `.path` file instead.
 
 ### Why -nostdlib is required
 
@@ -77,17 +85,6 @@ child processes via `execve`. This means `LD_PRELOAD` leaks to glibc children re
 the constructor clears at the C level. If `clear_ldpath.so` had a musl dependency, glibc children
 would crash trying to load `libc.musl-x86_64.so.1`. With `-nostdlib`, the `.so` has zero deps and
 is loadable by any libc.
-
-### Why the ELF wrapper exists
-
-`process.execPath` resolves to the real ELF binary, not shell wrappers. Without the ELF wrapper,
-plugin install would call the raw binary directly, with no `LD_LIBRARY_PATH` or `LD_PRELOAD` set.
-The static musl ELF wrapper at `lib/opencode` solves this by:
-
-1. Resolving its own directory via `/proc/self/exe`
-2. Setting `LD_LIBRARY_PATH` to that directory
-3. Setting `LD_PRELOAD` to `clear_ldpath.so`
-4. Exec'ing the real binary at `lib/opencode.bin`
 
 ### Evolution of the approach
 
@@ -100,16 +97,19 @@ The static musl ELF wrapper at `lib/opencode` solves this by:
 4. **v1.2.22 LD_LIBRARY_PATH only:** Only cleared `LD_PRELOAD`. `LD_LIBRARY_PATH` preserved
    always. Plugin install and glibc children worked in Docker, but `LD_LIBRARY_PATH` with
    musl-compiled libs broke glibc children on the actual QNAP NAS (ABI mismatch on same sonames).
-5. **Current (ELF wrapper):** Static ELF wrapper at `lib/opencode` re-establishes env before
-   exec'ing the real binary. `clear_ldpath.so` clears both `LD_PRELOAD` and `LD_LIBRARY_PATH`
-   in the normal path, preserves `LD_LIBRARY_PATH` only when `BUN_BE_BUN=1`. All 12 tests pass
-   on Stretch, Buster, and CentOS 7.
+5. **v1.2.22 ELF wrapper:** Static ELF wrapper at `lib/opencode` re-established env before
+   exec'ing the real binary. But `process.execPath` still resolved via `/proc/self/exe` to the
+   real binary (not the wrapper), so plugin install bypassed the wrapper and failed.
+6. **Current (musl .path file):** `LD_LIBRARY_PATH` eliminated entirely. The musl linker reads
+   `/tmp/etc/ld-musl-x86_64.path` to find bundled libs. `clear_ldpath.so` only clears
+   `LD_PRELOAD`. Plugin install works because `process.execPath` → `lib/opencode` finds its
+   libs via the `.path` file without any env vars. 12/12 tests pass on all distros.
 
 ## Known Issues & Gotchas
 
 ### 1. patchelf --set-rpath causes segfaults on Bun binaries
 
-Do NOT use `--set-rpath` with Bun binaries. The `LD_LIBRARY_PATH` approach works.
+Do NOT use `--set-rpath` with Bun binaries (~152MB). It corrupts them.
 
 ### 2. Docker testing requires `--platform linux/amd64`
 
@@ -124,21 +124,39 @@ The build targets x86_64 (QNAP NAS). On Apple Silicon (arm64) hosts, Docker cont
 
 All test Dockerfiles include the necessary repo fixes.
 
-### 4. The wrapper design exists for a reason
+### 4. The two-wrapper design exists for a reason
 
 The outer wrapper (`bin/opencode`) creates the musl loader symlink at
-`/tmp/.opencode-ld/ld-musl-x86_64.so.1`. This is needed because the binary's ELF interpreter is
-hardcoded to that path via `patchelf --set-interpreter`.
+`/tmp/.opencode-ld/ld-musl-x86_64.so.1` and the `.path` file at
+`/tmp/etc/ld-musl-x86_64.path`. These are needed because:
 
-The inner wrapper (`bin/opencode.bin`) sets `LD_LIBRARY_PATH` and `LD_PRELOAD` before exec'ing
-the real binary. The ELF wrapper (`lib/opencode`) does the same job but as a static binary,
-so it works when called via `process.execPath`.
+- The binary's ELF interpreter is hardcoded to `/tmp/.opencode-ld/ld-musl-x86_64.so.1` via
+  `patchelf --set-interpreter`
+- The musl linker reads `.path` relative to its grandparent dir (the symlink path, not resolved)
 
-### 5. LD_LIBRARY_PATH leaks to grandchildren in BUN_BE_BUN mode
+The inner wrapper (`bin/opencode.bin`) sets `LD_PRELOAD=clear_ldpath.so` before exec'ing the
+real binary, so the `.so` constructor can remove `LD_PRELOAD` from the environment.
 
-When `BUN_BE_BUN=1`, `LD_LIBRARY_PATH` is preserved for the bun process but also leaks to its
-grandchildren. This is an accepted tradeoff — plugin install is a brief operation and its
-sub-processes are bun-internal (network, npm registry), not arbitrary glibc tools.
+### 5. process.execPath resolves via /proc/self/exe
+
+Bun reads `/proc/self/exe` to determine `process.execPath`. This always resolves to the final
+exec'd binary, ignoring shell wrappers and argv[0]. There is no env var override. This is why
+the `.path` file approach is necessary — it allows the raw binary to find its libs without any
+env vars.
+
+### 6. musl .path file location depends on the linker's symlink path
+
+The musl linker computes the `.path` file location from its own name (the PT_INTERP path from
+the binary, before resolving symlinks). It extracts the grandparent directory:
+
+```
+/tmp/.opencode-ld/ld-musl-x86_64.so.1
+     ^^^^^^^^^^^^                          → last component
+/tmp/                                      → grandparent
+/tmp/etc/ld-musl-x86_64.path              → path file location
+```
+
+If you change the `patchelf --set-interpreter` path, the `.path` file location changes too.
 
 ## Testing
 
@@ -152,8 +170,8 @@ docker buildx build --platform linux/amd64 --build-arg VERSION=v1.2.22 \
 ### Run the automated test suite
 
 The test script (`build/test/test-env.sh`) runs 12 deterministic tests covering wrapper chain,
-ELF wrapper, plugin install, process.execPath re-invocation, LD_PRELOAD/LD_LIBRARY_PATH safety,
-and git compatibility. No API key required.
+direct binary launch, plugin install, process.execPath re-invocation, LD_PRELOAD safety, and
+git compatibility. No API key required.
 
 ```bash
 # Build and test on a specific distro

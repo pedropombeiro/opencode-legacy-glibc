@@ -4,12 +4,23 @@
 
 SCRIPT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 
-# Set up the musl loader symlink (binary is patched to look here)
+# Set up the musl loader symlink and library path file.
+# The binary is patched (via patchelf) to use /tmp/.opencode-ld/ld-musl-x86_64.so.1
+# as its ELF interpreter. The musl linker resolves its .path file relative to its
+# grandparent directory (second-to-last / in its own path). Since the interpreter
+# symlink is at /tmp/.opencode-ld/..., the grandparent is /tmp, so the .path file
+# goes at /tmp/etc/ld-musl-x86_64.path.
 LOADER_DIR="/tmp/.opencode-ld"
 LOADER_PATH="${LOADER_DIR}/ld-musl-x86_64.so.1"
-if [ ! -e "$LOADER_PATH" ] || [ "$(readlink -f "$LOADER_PATH" 2>/dev/null)" != "${SCRIPT_DIR}/lib/ld-musl-x86_64.so.1" ]; then
+MUSL_PATH_FILE="/tmp/etc/ld-musl-x86_64.path"
+LIB_DIR="${SCRIPT_DIR}/lib"
+if [ ! -e "$LOADER_PATH" ] || [ "$(readlink -f "$LOADER_PATH" 2>/dev/null)" != "${LIB_DIR}/ld-musl-x86_64.so.1" ]; then
     mkdir -p "$LOADER_DIR" 2>/dev/null
-    ln -sf "${SCRIPT_DIR}/lib/ld-musl-x86_64.so.1" "$LOADER_PATH" 2>/dev/null
+    ln -sf "${LIB_DIR}/ld-musl-x86_64.so.1" "$LOADER_PATH" 2>/dev/null
+fi
+if [ ! -f "$MUSL_PATH_FILE" ] || [ "$(cat "$MUSL_PATH_FILE" 2>/dev/null)" != "$LIB_DIR" ]; then
+    mkdir -p /tmp/etc 2>/dev/null
+    printf '%s' "$LIB_DIR" > "$MUSL_PATH_FILE" 2>/dev/null
 fi
 
 exec "${SCRIPT_DIR}/bin/opencode.bin" "$@"

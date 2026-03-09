@@ -3,12 +3,13 @@
 # No LLM API key required.
 #
 # Architecture:
-#   bin/opencode      -> bin/opencode.bin -> lib/opencode.elf (normal path)
-#   lib/opencode      -> ELF wrapper that re-establishes env -> lib/opencode.elf
-#   clear_ldpath.so   -> clears LD_PRELOAD + LD_LIBRARY_PATH from environ
+#   bin/opencode      -> creates musl .path file + loader symlink -> bin/opencode.bin
+#   bin/opencode.bin  -> sets LD_PRELOAD=clear_ldpath.so -> lib/opencode
+#   lib/opencode      -> real 152MB musl-linked binary
+#   clear_ldpath.so   -> clears LD_PRELOAD from environ
 #
-# process.execPath resolves to lib/opencode (the ELF wrapper), which
-# re-establishes LD_LIBRARY_PATH and LD_PRELOAD before exec'ing opencode.elf.
+# The musl dynamic linker finds libs via /tmp/.opencode-ld/ld-musl-x86_64.path
+# instead of LD_LIBRARY_PATH. This is invisible to glibc, solving the catch-22.
 #
 # Usage: docker run --platform linux/amd64 --rm <image> sh /opt/test-env.sh
 
@@ -22,9 +23,11 @@ fail() { FAIL=$((FAIL + 1)); printf "  \033[31mFAIL\033[0m: %s\n" "$1"; }
 
 LIB=/opt/opencode/lib
 BIN=/opt/opencode/bin
+LOADER_DIR=/tmp/.opencode-ld
 
-mkdir -p /tmp/.opencode-ld
-ln -sf "$LIB/ld-musl-x86_64.so.1" /tmp/.opencode-ld/ld-musl-x86_64.so.1
+mkdir -p "$LOADER_DIR" /tmp/etc
+ln -sf "$LIB/ld-musl-x86_64.so.1" "$LOADER_DIR/ld-musl-x86_64.so.1"
+printf '%s' "$LIB" > /tmp/etc/ld-musl-x86_64.path
 
 echo "=== 1. Wrapper chain launches opencode ==="
 if "$BIN/opencode" --version >/dev/null 2>&1; then
@@ -34,12 +37,12 @@ else
 fi
 
 echo ""
-echo "=== 2. ELF wrapper (lib/opencode) launches opencode ==="
+echo "=== 2. Direct binary launches via .path file ==="
 OC_VER=$("$LIB/opencode" --version 2>&1) || true
 if echo "$OC_VER" | grep -qE '^[0-9]+\.[0-9]+'; then
-  pass "lib/opencode ELF wrapper works: v$OC_VER"
+  pass "lib/opencode works via .path file: v$OC_VER"
 else
-  fail "lib/opencode ELF wrapper failed: $OC_VER"
+  fail "lib/opencode failed: $OC_VER"
 fi
 
 echo ""
@@ -60,18 +63,30 @@ else
 fi
 
 echo ""
-echo "=== 5. BUN_BE_BUN=1 via ELF wrapper launches bun ==="
+echo "=== 5. LD_PRELOAD is cleared by clear_ldpath.so ==="
+CHILD_PRELOAD=$(
+  LD_PRELOAD="$LIB/clear_ldpath.so" \
+    /bin/sh -c 'printf "%s" "$LD_PRELOAD"'
+) || true
+if [ -z "$CHILD_PRELOAD" ]; then
+  pass "LD_PRELOAD cleared by clear_ldpath.so"
+else
+  fail "LD_PRELOAD leaked: '$CHILD_PRELOAD'"
+fi
+
+echo ""
+echo "=== 6. BUN_BE_BUN=1 launches bun ==="
 BUN_VERSION=$(
   BUN_BE_BUN=1 "$LIB/opencode" --version 2>&1
 ) || true
 if echo "$BUN_VERSION" | grep -qE '^[0-9]+\.[0-9]+'; then
-  pass "BUN_BE_BUN=1 via ELF wrapper: bun $BUN_VERSION"
+  pass "BUN_BE_BUN=1 works: bun $BUN_VERSION"
 else
-  fail "BUN_BE_BUN=1 via ELF wrapper failed: $BUN_VERSION"
+  fail "BUN_BE_BUN=1 failed: $BUN_VERSION"
 fi
 
 echo ""
-echo "=== 6. Grandchild glibc processes work (LD_LIBRARY_PATH cleared) ==="
+echo "=== 7. Grandchild glibc processes work ==="
 cat > /tmp/test_grandchild.js <<'JSEOF'
 var cp = require("child_process");
 try {
@@ -91,31 +106,48 @@ else
 fi
 
 echo ""
-echo "=== 7. LD_LIBRARY_PATH is cleared in normal path (no BUN_BE_BUN) ==="
+echo "=== 8. No LD_LIBRARY_PATH in environment ==="
+cat > /tmp/test_no_ldpath.js <<'JSEOF'
+var cp = require("child_process");
+var out = cp.execSync("/bin/sh -c 'printf \"%s\" \"$LD_LIBRARY_PATH\"'", { encoding: "utf8" });
+process.stdout.write(out);
+JSEOF
 CHILD_LD=$(
-  LD_PRELOAD="$LIB/clear_ldpath.so" LD_LIBRARY_PATH="$LIB" \
-    /bin/sh -c 'printf "%s" "$LD_LIBRARY_PATH"'
+  LD_PRELOAD="$LIB/clear_ldpath.so" BUN_BE_BUN=1 \
+    "$LIB/opencode" run /tmp/test_no_ldpath.js 2>/dev/null
 ) || true
 if [ -z "$CHILD_LD" ]; then
-  pass "LD_LIBRARY_PATH cleared by clear_ldpath.so (normal path)"
+  pass "LD_LIBRARY_PATH not set in grandchild"
 else
-  fail "LD_LIBRARY_PATH leaked: '$CHILD_LD'"
+  fail "LD_LIBRARY_PATH leaked to grandchild: '$CHILD_LD'"
 fi
 
 echo ""
-echo "=== 7b. LD_LIBRARY_PATH preserved when BUN_BE_BUN=1 ==="
-CHILD_LD_BUN=$(
-  LD_PRELOAD="$LIB/clear_ldpath.so" LD_LIBRARY_PATH="$LIB" BUN_BE_BUN=1 \
-    /bin/sh -c 'printf "%s" "$LD_LIBRARY_PATH"'
+echo "=== 9. process.execPath re-invocation works (simulates plugin install) ==="
+cat > /tmp/test_reinvoke.js <<'JSEOF'
+var cp = require("child_process");
+try {
+  var env = Object.assign({}, process.env, { BUN_BE_BUN: "1" });
+  delete env.LD_PRELOAD;
+  delete env.LD_LIBRARY_PATH;
+  var out = cp.execSync(process.execPath + " --version", { encoding: "utf8", env: env });
+  process.stdout.write(out.trim());
+} catch(e) {
+  process.stdout.write("FAIL:" + (e.status || "") + ":" + e.message.split("\n")[0]);
+}
+JSEOF
+REINVOKE=$(
+  LD_PRELOAD="$LIB/clear_ldpath.so" BUN_BE_BUN=1 \
+    "$LIB/opencode" run /tmp/test_reinvoke.js 2>/dev/null
 ) || true
-if [ "$CHILD_LD_BUN" = "$LIB" ]; then
-  pass "LD_LIBRARY_PATH preserved for BUN_BE_BUN=1 path"
+if echo "$REINVOKE" | grep -qE '^[0-9]+\.[0-9]+'; then
+  pass "process.execPath re-invocation works: bun $REINVOKE"
 else
-  fail "LD_LIBRARY_PATH expected '$LIB', got '$CHILD_LD_BUN'"
+  fail "process.execPath re-invocation failed: '$REINVOKE'"
 fi
 
 echo ""
-echo "=== 8. Plugin install succeeds ==="
+echo "=== 10. Plugin install succeeds ==="
 mkdir -p /tmp/testpkg
 echo '{}' > /tmp/testpkg/package.json
 if BUN_BE_BUN=1 "$LIB/opencode" add --cwd /tmp/testpkg opencode-anthropic-auth@0.0.13 >/dev/null 2>&1; then
@@ -130,36 +162,15 @@ else
 fi
 
 echo ""
-echo "=== 9. Plugin re-invocation via process.execPath works ==="
-cat > /tmp/test_reinvoke.js <<'JSEOF'
-var cp = require("child_process");
-try {
-  var env = Object.assign({}, process.env, { BUN_BE_BUN: "1" });
-  var out = cp.execSync(process.execPath + " --version", { encoding: "utf8", env: env });
-  process.stdout.write(out.trim());
-} catch(e) {
-  process.stdout.write("FAIL:" + (e.status || "") + ":" + e.message.split("\n")[0]);
-}
-JSEOF
-REINVOKE=$(
-  BUN_BE_BUN=1 "$LIB/opencode" run /tmp/test_reinvoke.js 2>/dev/null
-) || true
-if echo "$REINVOKE" | grep -qE '^[0-9]+\.[0-9]+'; then
-  pass "process.execPath re-invocation works: bun $REINVOKE"
+echo "=== 11. git works (no LD_LIBRARY_PATH contamination) ==="
+if git --version >/dev/null 2>&1; then
+  pass "git works without LD_LIBRARY_PATH"
 else
-  fail "process.execPath re-invocation failed: '$REINVOKE'"
+  fail "git broken"
 fi
 
 echo ""
-echo "=== 10. git works when LD_LIBRARY_PATH is set ==="
-if LD_LIBRARY_PATH="$LIB" git --version >/dev/null 2>&1; then
-  pass "git works with LD_LIBRARY_PATH set"
-else
-  fail "git broken with LD_LIBRARY_PATH set"
-fi
-
-echo ""
-echo "=== 11. opencode.bin wrapper works ==="
+echo "=== 12. opencode.bin wrapper works ==="
 OC_VERSION2=$(
   "$BIN/opencode.bin" --version 2>&1
 ) || true
