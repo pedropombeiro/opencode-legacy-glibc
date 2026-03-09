@@ -27,8 +27,8 @@ COPY opencode /opencode/bin/opencode
 COPY opencode.bin /opencode/bin/opencode.bin
 RUN chmod +x /opencode/bin/opencode /opencode/bin/opencode.bin
 
-# Build a small shared library that clears LD_LIBRARY_PATH and LD_PRELOAD
-# This prevents child processes from inheriting the musl library paths
+# Build a small shared library that clears LD_PRELOAD
+# This prevents clear_ldpath.so from being injected into glibc-linked child processes
 FROM --platform=$BUILD_PLATFORM alpine:latest AS ldpreload
 RUN apk add --no-cache gcc musl-dev
 COPY clear_ldpath.c /tmp/
