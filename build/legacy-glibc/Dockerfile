@@ -4,7 +4,7 @@ FROM --platform=$BUILD_PLATFORM oven/bun:debian AS builder
 
 ARG VERSION
 
-RUN apt-get update && apt-get install -y git patchelf && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y build-essential git patchelf python3 && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
 RUN git clone --depth 1 --branch "${VERSION}" https://github.com/anomalyco/opencode.git .
