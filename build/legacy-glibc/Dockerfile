@@ -16,7 +16,7 @@ RUN bun install
 # equivalent scalar code; no functionality is lost.
 # --all-features enables everything the input uses (bulk-memory, sign-ext, etc.)
 # then --disable-simd selectively removes only SIMD support.
-RUN set -e && find node_modules -name '*.wasm' -path '*/tree-sitter*' -print \
+RUN set -e && find node_modules -name '*.wasm' -print \
       -exec wasm-opt --all-features --disable-simd -O2 -o {} {} \;
 
 # Strip 'v' prefix from VERSION for OPENCODE_VERSION (e.g., v1.1.35 -> 1.1.35)
