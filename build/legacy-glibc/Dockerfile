@@ -14,8 +14,10 @@ RUN bun install
 # Strip WASM SIMD instructions so the Bash tool's tree-sitter parser loads on
 # CPUs without AVX (e.g., Intel Celeron J4125). wasm-opt lowers SIMD ops to
 # equivalent scalar code; no functionality is lost.
+# --all-features enables everything the input uses (bulk-memory, sign-ext, etc.)
+# then --disable-simd selectively removes only SIMD support.
 RUN find node_modules -name '*.wasm' -path '*/tree-sitter*' \
-      -exec wasm-opt --disable-simd -O2 -o {} {} \;
+      -exec wasm-opt --all-features --disable-simd -O2 -o {} {} \;
 
 # Strip 'v' prefix from VERSION for OPENCODE_VERSION (e.g., v1.1.35 -> 1.1.35)
 RUN OPENCODE_VERSION="${VERSION#v}" ./packages/opencode/script/build.ts
