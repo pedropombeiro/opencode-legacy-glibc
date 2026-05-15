@@ -25,22 +25,22 @@ No wrapper or `LD_LIBRARY_PATH` needed for re-invocation. The musl linker reads
 
 ### Key files
 
-| File | Purpose |
-|------|---------|
-| `bin/opencode` | Outer shell wrapper — creates musl loader symlink + `.path` file |
-| `bin/opencode.bin` | Inner shell wrapper — sets `LD_PRELOAD`, exec's real binary |
-| `lib/opencode` | Patched OpenCode ELF binary (~152MB, musl dynamic linker) |
-| `lib/ld-musl-x86_64.so.1` | musl dynamic linker (from Alpine) |
-| `lib/libstdc++.so.6` | C++ standard library (from Alpine, musl-compiled) |
-| `lib/libgcc_s.so.1` | GCC support library (from Alpine, musl-compiled) |
-| `lib/clear_ldpath.so` | Self-contained LD_PRELOAD lib (~14KB, no deps) |
+| File                      | Purpose                                                          |
+| ------------------------- | ---------------------------------------------------------------- |
+| `bin/opencode`            | Outer shell wrapper — creates musl loader symlink + `.path` file |
+| `bin/opencode.bin`        | Inner shell wrapper — sets `LD_PRELOAD`, exec's real binary      |
+| `lib/opencode`            | Patched OpenCode ELF binary (~152MB, musl dynamic linker)        |
+| `lib/ld-musl-x86_64.so.1` | musl dynamic linker (from Alpine)                                |
+| `lib/libstdc++.so.6`      | C++ standard library (from Alpine, musl-compiled)                |
+| `lib/libgcc_s.so.1`       | GCC support library (from Alpine, musl-compiled)                 |
+| `lib/clear_ldpath.so`     | Self-contained LD_PRELOAD lib (~14KB, no deps)                   |
 
 ### Runtime files (created by bin/opencode at startup)
 
-| File | Purpose |
-|------|---------|
+| File                                    | Purpose                                                       |
+| --------------------------------------- | ------------------------------------------------------------- |
 | `/tmp/.opencode-ld/ld-musl-x86_64.so.1` | Symlink to `lib/ld-musl-x86_64.so.1` (ELF interpreter target) |
-| `/tmp/etc/ld-musl-x86_64.path` | Contains `lib/` absolute path (musl library search path) |
+| `/tmp/etc/ld-musl-x86_64.path`          | Contains `lib/` absolute path (musl library search path)      |
 
 ## How musl Finds Libraries (the .path file)
 
@@ -160,20 +160,100 @@ the binary, before resolving symlinks). It extracts the grandparent directory:
 
 If you change the `patchelf --set-interpreter` path, the `.path` file location changes too.
 
+## OpenTUI Native Library Substitution (Issue #3)
+
+Starting with opencode `1.14.49`, the bundled `@opentui/core@0.2.7+` no longer
+loads its native renderer through Bun's embedded imports. Instead, the loader
+extracts the `.so` to a temp directory and `dlopen`s it through a portable
+platform layer ([opentui#1027](https://github.com/anomalyco/opentui/pull/1027)).
+
+Upstream `@opentui/core-linux-x64` is built with
+`zig build -Dtarget=x86_64-linux-gnu.2.28`, so the extracted `.so` requires
+`GLIBC_2.27` and fails to load on:
+
+- QTS 5.2.9 (glibc 2.21)
+- CentOS 7 (glibc 2.17)
+- Debian Stretch (glibc 2.24)
+
+CLI subcommands (`opencode run`, `opencode --version`, `opencode serve`) are
+unaffected because they never `dlopen` the renderer. Only TUI mode hits the
+broken path; the bug presents as a hang at startup with this log line:
+
+```
+ERROR  service=default e=Failed to initialize OpenTUI render library:
+  Failed to open library "/opt/tmp/.<hash>-00000001.so":
+  Error loading shared library ld-linux-x86-64.so.2: No such file or
+  directory (needed by /opt/tmp/.<hash>-00000001.so)
+```
+
+(The error text is misleading. `/lib64/ld-linux-x86-64.so.2` does exist; the
+real failure is the GLIBC symbol version requirement.)
+
+### Fix: rebuild opentui against musl
+
+`build/legacy-glibc/Dockerfile` rebuilds `@opentui/core-linux-x64/libopentui.so`
+from source as part of the build pipeline:
+
+1. **`opencode-clone` stage**: clones the requested `opencode` tag and reads
+   the pinned `@opentui/core` version from the workspace `catalog:`.
+2. **`opentui-builder` stage**: installs Zig 0.15.2 (the version opentui's
+   `build.zig` enforces via `SUPPORTED_ZIG_VERSIONS`), clones opentui at the
+   matching tag, patches `packages/core/src/zig/build.zig` to replace
+   `SUPPORTED_TARGETS` with a single `x86_64-linux-musl` entry, then runs
+   `bun scripts/build.ts --native --all` (the `--all` path is the only zig
+   build flow that doesn't trigger the build_runner panic, see below).
+3. **`builder` stage**: clones opencode again, runs `bun install`, then
+   overwrites the glibc-linked `libopentui.so` in
+   `node_modules/@opentui/core-linux-x64/` with the musl-built one. `bun build
+--compile` then embeds the musl `.so` via bunfs.
+
+At runtime the extracted `.so` is loaded by the musl dynamic linker already
+mapped into opencode (since the main binary's ELF interpreter is patched to
+the bundled musl loader). The `.so`'s `DT_NEEDED` references `libc.musl-x86_64.so.1`,
+which the musl linker resolves via the `.path` file — no glibc dependency.
+
+### Zig 0.15.2 build_runner panic
+
+Zig 0.15.2's `build_runner.zig` panics intermittently with `index out of bounds:
+index 3, len 3` in `Random.shuffleWithIndex` while shuffling the build graph.
+Whether it fires depends on the random seed. Workarounds:
+
+- Use the `--all` code path in opentui's `scripts/build.ts` (via the `-Dall`
+  zig option). The graph traversal is different and panics less frequently.
+- Combine with a patched `SUPPORTED_TARGETS` to avoid actually cross-compiling
+  for every platform (we'd need macOS SDKs etc).
+- Retry the build up to 12 times if it panics. With one Linux musl target,
+  the bug fires on roughly 1 in 2 seeds; 12 retries gives a vanishingly small
+  false-failure rate.
+
+### Verifying the fix
+
+The build pipeline does two checks:
+
+1. After building the `.so` in `opentui-builder`, `readelf -V` is grep'd for
+   `GLIBC_[0-9]` symbols — if any are present the build aborts.
+2. After copying to opencode's `node_modules`, `readelf -d` is logged for
+   manual inspection.
+
+Test 13 in `build/test/test-env.sh` is the runtime regression test: it runs
+opencode in TUI mode under a SIGKILL timeout with stdin closed and asserts
+the `Failed to initialize OpenTUI render library` error is not present.
+
 ## Testing
 
 ### Build the artifact
 
 ```bash
-docker buildx build --platform linux/amd64 --build-arg VERSION=v1.2.22 \
+docker buildx build --platform linux/amd64 --build-arg VERSION=v1.15.0 \
   -f build/legacy-glibc/Dockerfile -o out build/legacy-glibc/
 ```
 
 ### Run the automated test suite
 
-The test script (`build/test/test-env.sh`) runs 12 deterministic tests covering wrapper chain,
-direct binary launch, plugin install, process.execPath re-invocation, LD_PRELOAD safety, and
-git compatibility. No API key required.
+The test script (`build/test/test-env.sh`) runs 13 deterministic tests covering wrapper chain,
+direct binary launch, plugin install, process.execPath re-invocation, LD_PRELOAD safety, git
+compatibility, and the OpenTUI native library load (regression test for issue #3). No API key
+required.
 
 ```bash
 # Build and test on a specific distro
@@ -190,10 +270,10 @@ docker run --platform linux/amd64 --rm opencode-test-centos7 sh /opt/test-env.sh
 
 ### GLIBC compatibility matrix
 
-Tested and passing (12/12 tests) as of v1.2.22:
+Tested and passing (13/13 tests) as of v1.15.0:
 
-| Image | GLIBC | Status |
-|-------|-------|--------|
-| centos:7 | 2.17 | 12/12 |
-| debian:stretch-slim | 2.24 | 12/12 |
-| debian:buster-slim | 2.28 | 12/12 |
+| Image               | GLIBC | Status |
+| ------------------- | ----- | ------ |
+| centos:7            | 2.17  | 13/13  |
+| debian:stretch-slim | 2.24  | 13/13  |
+| debian:buster-slim  | 2.28  | 13/13  |

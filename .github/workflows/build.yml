@@ -1,5 +1,7 @@
+---
 name: Build for legacy GLIBC
 
+# yamllint disable-line rule:truthy
 on:
   schedule:
     - cron: "0 * * * *" # Every hour
@@ -71,16 +73,28 @@ jobs:
             --output type=local,dest=./dist \
             ./build/legacy-glibc
 
+      - name: Run test suite on CentOS 7 (glibc 2.17, stricter than QTS NAS 2.21)
+        run: |
+          # Copy the build output into ./out so the test Dockerfiles can find it.
+          rm -rf out
+          mv dist out
+
+          docker build --platform linux/amd64 \
+            -t opencode-test-centos7 \
+            -f build/test/Dockerfile.centos7 .
+          docker run --platform linux/amd64 --rm opencode-test-centos7 \
+            sh /opt/test-env.sh
+
       - name: Create tarball
         run: |
-          cd dist
+          cd out
           tar -czvf opencode-${{ needs.check.outputs.tag }}-linux-x64-legacy-glibc.tar.gz opencode
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: opencode-${{ needs.check.outputs.tag }}-linux-x64-legacy-glibc
-          path: dist/opencode-${{ needs.check.outputs.tag }}-linux-x64-legacy-glibc.tar.gz
+          path: out/opencode-${{ needs.check.outputs.tag }}-linux-x64-legacy-glibc.tar.gz
 
       - name: Create release
         run: |
@@ -100,6 +114,6 @@ jobs:
             2. Run \`./opencode/bin/opencode\`
 
           Based on upstream release: https://github.com/anomalyco/opencode/releases/tag/${{ needs.check.outputs.tag }}" \
-            dist/opencode-${{ needs.check.outputs.tag }}-linux-x64-legacy-glibc.tar.gz
+            out/opencode-${{ needs.check.outputs.tag }}-linux-x64-legacy-glibc.tar.gz
         env:
           GH_TOKEN: ${{ github.token }}

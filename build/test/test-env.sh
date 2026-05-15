@@ -18,8 +18,14 @@ set -e
 PASS=0
 FAIL=0
 
-pass() { PASS=$((PASS + 1)); printf "  \033[32mPASS\033[0m: %s\n" "$1"; }
-fail() { FAIL=$((FAIL + 1)); printf "  \033[31mFAIL\033[0m: %s\n" "$1"; }
+pass() {
+  PASS=$((PASS + 1))
+  printf "  \033[32mPASS\033[0m: %s\n" "$1"
+}
+fail() {
+  FAIL=$((FAIL + 1))
+  printf "  \033[31mFAIL\033[0m: %s\n" "$1"
+}
 
 LIB=/opt/opencode/lib
 BIN=/opt/opencode/bin
@@ -27,7 +33,7 @@ LOADER_DIR=/tmp/.opencode-ld
 
 mkdir -p "$LOADER_DIR" /tmp/etc
 ln -sf "$LIB/ld-musl-x86_64.so.1" "$LOADER_DIR/ld-musl-x86_64.so.1"
-printf '%s' "$LIB" > /tmp/etc/ld-musl-x86_64.path
+printf '%s' "$LIB" >/tmp/etc/ld-musl-x86_64.path
 
 echo "=== 1. Wrapper chain launches opencode ==="
 if "$BIN/opencode" --version >/dev/null 2>&1; then
@@ -87,7 +93,7 @@ fi
 
 echo ""
 echo "=== 7. Grandchild glibc processes work ==="
-cat > /tmp/test_grandchild.js <<'JSEOF'
+cat >/tmp/test_grandchild.js <<'JSEOF'
 var cp = require("child_process");
 try {
   var out = cp.execSync("/bin/sh -c 'echo grandchild_ok'", { encoding: "utf8" });
@@ -107,7 +113,7 @@ fi
 
 echo ""
 echo "=== 8. No LD_LIBRARY_PATH in environment ==="
-cat > /tmp/test_no_ldpath.js <<'JSEOF'
+cat >/tmp/test_no_ldpath.js <<'JSEOF'
 var cp = require("child_process");
 var out = cp.execSync("/bin/sh -c 'printf \"%s\" \"$LD_LIBRARY_PATH\"'", { encoding: "utf8" });
 process.stdout.write(out);
@@ -124,7 +130,7 @@ fi
 
 echo ""
 echo "=== 9. process.execPath re-invocation works (simulates plugin install) ==="
-cat > /tmp/test_reinvoke.js <<'JSEOF'
+cat >/tmp/test_reinvoke.js <<'JSEOF'
 var cp = require("child_process");
 try {
   var env = Object.assign({}, process.env, { BUN_BE_BUN: "1" });
@@ -149,9 +155,9 @@ fi
 echo ""
 echo "=== 10. Plugin install succeeds ==="
 mkdir -p /tmp/testpkg
-echo '{}' > /tmp/testpkg/package.json
+echo '{}' >/tmp/testpkg/package.json
 if BUN_BE_BUN=1 "$LIB/opencode" add --cwd /tmp/testpkg opencode-anthropic-auth@0.0.13 >/dev/null 2>&1; then
-  PKG_COUNT=$(ls /tmp/testpkg/node_modules/ 2>/dev/null | wc -l)
+  PKG_COUNT=$(find /tmp/testpkg/node_modules/ -mindepth 1 -maxdepth 1 2>/dev/null | wc -l)
   if [ "$PKG_COUNT" -gt 0 ]; then
     pass "plugin install: $PKG_COUNT packages in node_modules"
   else
@@ -178,6 +184,25 @@ if echo "$OC_VERSION2" | grep -qE '^[0-9]+\.[0-9]+'; then
   pass "opencode.bin wrapper works: v$OC_VERSION2"
 else
   fail "opencode.bin wrapper failed: $OC_VERSION2"
+fi
+
+echo ""
+echo "=== 13. OpenTUI native library loads (regression test for issue #3) ==="
+# opencode 1.14.49+ extracts the @opentui/core .so from bunfs and dlopen's it.
+# Upstream ships it linked against glibc 2.28+, which fails on glibc 2.21 (QTS
+# 5.2.9) and on glibc 2.17 (centos7). We rebuild it against musl. This test
+# triggers the dlopen path by running opencode with stdin closed and TUI logs
+# enabled, and asserts the failure message is absent. timeout uses SIGKILL so
+# the TUI cannot ignore the signal and the test cannot hang.
+TUI_OUT=$(timeout -s KILL 10 "$BIN/opencode" --print-logs --log-level ERROR </dev/null 2>&1 || true)
+if echo "$TUI_OUT" | grep -q "Failed to initialize OpenTUI render library"; then
+  fail "OpenTUI native library failed to load — issue #3 regression"
+  echo "$TUI_OUT" | grep -A2 "Failed to initialize OpenTUI" | head -6
+elif echo "$TUI_OUT" | grep -qE 'GLIBC_2\.(2[5-9]|3[0-9])'; then
+  fail "OpenTUI native library reports missing GLIBC symbols"
+  echo "$TUI_OUT" | grep -E 'GLIBC_' | head -3
+else
+  pass "OpenTUI native library loads without glibc errors"
 fi
 
 echo ""
