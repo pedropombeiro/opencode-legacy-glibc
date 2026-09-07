@@ -206,6 +206,18 @@ else
 fi
 
 echo ""
+echo "=== 14. OpenCode runtime initializes without internal errors ==="
+# `debug v2` exercises the runtime's dependency graph without an LLM API key.
+# A QTS-only regression in v1.18.29 crashed here and on every prompt with:
+# TypeError: undefined is not an object (evaluating 'a.name')
+if RUNTIME_OUT=$(timeout 30 "$BIN/opencode" debug v2 2>&1); then
+  pass "opencode runtime initializes"
+else
+  fail "opencode runtime initialization failed"
+  printf '%s\n' "$RUNTIME_OUT" | tail -10
+fi
+
+echo ""
 echo "============================================"
 printf "Results: \033[32m%d passed\033[0m" "$PASS"
 [ "$FAIL" -gt 0 ] && printf ", \033[31m%d failed\033[0m" "$FAIL"
