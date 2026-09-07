@@ -18,25 +18,45 @@ jobs:
     outputs:
       tag: ${{ steps.resolve.outputs.tag }}
       should_build: ${{ steps.resolve.outputs.should_build }}
+      failed_marker: ${{ steps.resolve.outputs.failed_marker }}
     steps:
       - uses: actions/checkout@v4
 
       - name: Resolve tag to build
         id: resolve
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+          GH_TOKEN: ${{ github.token }}
         run: |
-          if [[ -n "${{ inputs.tag }}" ]]; then
-            echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
-            echo "should_build=true" >> "$GITHUB_OUTPUT"
-            echo "Using manually specified tag: ${{ inputs.tag }}"
-            exit 0
+          if [[ -n "$INPUT_TAG" ]]; then
+            LATEST_TAG="$INPUT_TAG"
+            echo "Using manually specified tag: $LATEST_TAG"
+          else
+            # Get latest upstream tag
+            LATEST_TAG=$(curl -sf https://api.github.com/repos/anomalyco/opencode/releases/latest | jq -r '.tag_name')
+            echo "Latest upstream tag: $LATEST_TAG"
           fi
-
-          # Get latest upstream tag
-          LATEST_TAG=$(curl -sf https://api.github.com/repos/anomalyco/opencode/releases/latest | jq -r '.tag_name')
-          echo "Latest upstream tag: $LATEST_TAG"
 
           if [[ -z "$LATEST_TAG" || "$LATEST_TAG" == "null" ]]; then
             echo "No tags found"
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          BUILD_TREE=$(git rev-parse HEAD:build)
+          FAILED_MARKER="ci-failed/${LATEST_TAG}/${BUILD_TREE}"
+          echo "tag=$LATEST_TAG" >> "$GITHUB_OUTPUT"
+          echo "failed_marker=$FAILED_MARKER" >> "$GITHUB_OUTPUT"
+
+          # Manual runs explicitly retry a version even if this build tree rejected it.
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if git ls-remote --exit-code --tags origin "refs/tags/$FAILED_MARKER" >/dev/null 2>&1; then
+            echo "$LATEST_TAG already failed with build tree $BUILD_TREE, skipping"
             echo "should_build=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -51,9 +71,6 @@ jobs:
             echo "tag=$LATEST_TAG" >> "$GITHUB_OUTPUT"
             echo "should_build=true" >> "$GITHUB_OUTPUT"
           fi
-        env:
-          GH_TOKEN: ${{ github.token }}
-
   build:
     needs: check
     if: needs.check.outputs.should_build == 'true'
@@ -73,7 +90,7 @@ jobs:
             --output type=local,dest=./dist \
             ./build/legacy-glibc
 
-      - name: Run test suite on CentOS 7 (glibc 2.17, stricter than QTS NAS 2.21)
+      - name: Prepare CentOS 7 test image
         run: |
           # Copy the build output into ./out so the test Dockerfiles can find it.
           rm -rf out
@@ -82,8 +99,29 @@ jobs:
           docker build --platform linux/amd64 \
             -t opencode-test-centos7 \
             -f build/test/Dockerfile.centos7 .
+
+      - name: Run test suite on CentOS 7 (glibc 2.17, stricter than QTS NAS 2.21)
+        id: test
+        continue-on-error: true
+        run: |
           docker run --platform linux/amd64 --rm opencode-test-centos7 \
             sh /opt/test-env.sh
+
+      - name: Record rejected build
+        if: steps.test.outcome == 'failure'
+        env:
+          FAILED_MARKER: ${{ needs.check.outputs.failed_marker }}
+        run: |
+          if git ls-remote --exit-code --tags origin "refs/tags/$FAILED_MARKER" >/dev/null 2>&1; then
+            echo "Failure marker already exists: $FAILED_MARKER"
+          else
+            git tag "$FAILED_MARKER" "$GITHUB_SHA"
+            git push origin "refs/tags/$FAILED_MARKER"
+          fi
+
+      - name: Fail rejected build
+        if: steps.test.outcome == 'failure'
+        run: exit 1
 
       - name: Create tarball
         run: |
