@@ -196,13 +196,16 @@ from source as part of the build pipeline:
 
 1. **`opencode-clone` stage**: clones the requested `opencode` tag and reads
    the pinned `@opentui/core` version from the workspace `catalog:`.
-2. **`opentui-builder` stage**: installs Zig 0.15.2 (the version opentui's
+2. **`bun-runtime` stage**: reads `packageManager` from the cloned OpenCode
+   release and installs that exact Bun version. Both build stages inherit it.
+3. **`opentui-builder` stage**: installs Zig 0.15.2 (the version opentui's
    `build.zig` enforces via `SUPPORTED_ZIG_VERSIONS`), clones opentui at the
    matching tag, patches `packages/core/src/zig/build.zig` to replace
    `SUPPORTED_TARGETS` with a single `x86_64-linux-musl` entry, then runs
    `bun scripts/build.ts --native --all` (the `--all` path is the only zig
    build flow that doesn't trigger the build_runner panic, see below).
-3. **`builder` stage**: clones opencode again, runs `bun install`, then
+4. **`builder` stage**: reuses the OpenCode clone, applies the filesystem
+   import patch, runs `bun install --frozen-lockfile`, then
    overwrites the glibc-linked `libopentui.so` in
    `node_modules/@opentui/core-linux-x64/` with the musl-built one. `bun build
 --compile` then embeds the musl `.so` via bunfs.
@@ -241,6 +244,44 @@ the `Failed to initialize OpenTUI render library` error is not present.
 
 ## Testing
 
+### Runtime initialization regression in Bun 1.4.x builds
+
+The legacy v1.18.28 and v1.18.29 artifacts built with Bun 1.4.1 fail during
+service graph initialization with:
+
+```text
+undefined is not an object (evaluating 'a.name')
+```
+
+The v1.18.29 CI rebuild with Bun 1.4.2 fails in the same command. The failure
+reproduces on both CentOS 7 and Debian Bookworm, independently of the host's
+glibc version.
+
+`packages/core/src/filesystem.ts` captures `FileSystemSearch.node` in a
+dependency array. `filesystem/search.ts` imports runtime schemas back through
+`filesystem.ts`, creating a circular import. The failing bundle constructs
+`FileSystem.node` before `FileSystemSearch.node`, storing `undefined` in the
+array. Traversing the graph then fails at:
+
+```text
+group -> plugin-internal -> @opencode/v2/FileSystem -> undefined
+```
+
+The Dockerfile installs the Bun version pinned by the requested upstream
+release instead of using the floating `oven/bun:debian` image. It also applies
+`build/legacy-glibc/filesystem-search.patch`, which imports runtime schemas
+directly from `@opencode-ai/schema/filesystem` and retains a type-only import
+from `filesystem.ts`. If upstream changes prevent the patch from applying,
+review whether the cycle still exists before updating or removing the patch.
+
+On September 9, 2026, a full v1.18.29 rebuild with Bun 1.3.14 and this patch
+passed all 14 compatibility tests on CentOS 7 with glibc 2.17. Testing the
+rebuilt artifact on the NAS is still required.
+
+The NAS uses this repository's builds. v1.18.26 is the last version reported
+working there. The archived v1.18.27 artifact passes this initialization check
+in Docker, so the NAS-specific v1.18.27 failure remains unconfirmed.
+
 ### Build the artifact
 
 ```bash
@@ -250,10 +291,10 @@ docker buildx build --platform linux/amd64 --build-arg VERSION=v1.15.0 \
 
 ### Run the automated test suite
 
-The test script (`build/test/test-env.sh`) runs 13 deterministic tests covering wrapper chain,
+The test script (`build/test/test-env.sh`) runs 14 tests covering wrapper chain,
 direct binary launch, plugin install, process.execPath re-invocation, LD_PRELOAD safety, git
-compatibility, and the OpenTUI native library load (regression test for issue #3). No API key
-required.
+compatibility, the OpenTUI native library load (regression test for issue #3),
+and runtime initialization through `opencode debug v2`. No API key is required.
 
 ```bash
 # Build and test on a specific distro

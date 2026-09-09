@@ -2,15 +2,14 @@
 ARG BUILD_PLATFORM=linux/amd64
 
 # ---------------------------------------------------------------------------
-# Stage 1: clone opencode, discover the @opentui/core version it depends on.
-# This stage exists only to extract metadata; the version is written to
-# /opt/opentui-version so later stages can read it via COPY --from.
+# Stage 1: clone opencode and discover its pinned toolchain and OpenTUI version.
+# Later build stages inherit the source, Bun, and /opt/opentui-version.
 # ---------------------------------------------------------------------------
-FROM --platform=$BUILD_PLATFORM oven/bun:debian AS opencode-clone
+FROM --platform=$BUILD_PLATFORM debian:bookworm-slim AS opencode-clone
 
 ARG VERSION
 
-RUN apt-get update && apt-get install -y --no-install-recommends git jq ca-certificates && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends git jq ca-certificates curl unzip && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
 RUN git clone --depth 1 --branch "${VERSION}" https://github.com/anomalyco/opencode.git .
@@ -35,6 +34,19 @@ RUN mkdir -p /opt \
     && echo "$OPENTUI_VERSION" > /opt/opentui-version \
     && echo "Detected @opentui/core version: $OPENTUI_VERSION"
 
+# Use the same compiler as the requested upstream release. A floating Bun 1.4.x
+# image changed module initialization order and broke the runtime dependency graph.
+# Download the x64 baseline build, matching upstream's setup-bun action.
+FROM opencode-clone AS bun-runtime
+RUN set -eu \
+    && BUN_VERSION=$(jq -er '.packageManager | capture("^bun@(?<version>[0-9]+\\.[0-9]+\\.[0-9]+)$").version' package.json) \
+    && curl -fsSL -o /tmp/bun.zip "https://github.com/oven-sh/bun/releases/download/bun-v${BUN_VERSION}/bun-linux-x64-baseline.zip" \
+    && unzip -q /tmp/bun.zip -d /opt \
+    && install -m 755 /opt/bun-linux-x64-baseline/bun /usr/local/bin/bun \
+    && rm -rf /tmp/bun.zip /opt/bun-linux-x64-baseline \
+    && test "$(bun --version)" = "$BUN_VERSION" \
+    && echo "Using upstream Bun $BUN_VERSION"
+
 # ---------------------------------------------------------------------------
 # Stage 2: rebuild @opentui/core native library against musl libc.
 #
@@ -48,7 +60,7 @@ RUN mkdir -p /opt \
 # .so links against musl libc, which is already bundled in lib/. The musl
 # dynamic linker resolves it via the .path file mechanism — no glibc needed.
 # ---------------------------------------------------------------------------
-FROM --platform=$BUILD_PLATFORM oven/bun:debian AS opentui-builder
+FROM bun-runtime AS opentui-builder
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -67,8 +79,6 @@ RUN set -eux \
     && rm /tmp/zig.tar.xz \
     && ln -s "/opt/zig-x86_64-linux-${ZIG_VERSION}/zig" /usr/local/bin/zig \
     && zig version
-
-COPY --from=opencode-clone /opt/opentui-version /opt/opentui-version
 
 WORKDIR /opentui
 RUN OPENTUI_VERSION="$(cat /opt/opentui-version)" \
@@ -148,7 +158,7 @@ RUN set -e \
 # ---------------------------------------------------------------------------
 # Stage 3: build opencode, embedding the musl-built opentui .so.
 # ---------------------------------------------------------------------------
-FROM --platform=$BUILD_PLATFORM oven/bun:debian AS builder
+FROM bun-runtime AS builder
 
 ARG VERSION
 
@@ -157,9 +167,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
-RUN git clone --depth 1 --branch "${VERSION}" https://github.com/anomalyco/opencode.git .
 
-RUN bun install
+# FileSystem eagerly captures FileSystemSearch.node. Importing runtime schemas
+# back through FileSystem creates a cycle that can capture an undefined node.
+# Fail on patch drift so upstream changes require an explicit review.
+COPY filesystem-search.patch /tmp/filesystem-search.patch
+RUN if [ -f packages/core/src/filesystem/search.ts ]; then \
+        git apply --check /tmp/filesystem-search.patch \
+        && git apply /tmp/filesystem-search.patch; \
+    fi
+
+RUN bun install --frozen-lockfile
 
 # Replace the glibc-linked opentui .so with our musl-built one BEFORE running
 # opencode's build.ts. `bun build --compile` embeds whatever is in
