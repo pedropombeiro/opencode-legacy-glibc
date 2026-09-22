@@ -204,8 +204,8 @@ from source as part of the build pipeline:
    `SUPPORTED_TARGETS` with a single `x86_64-linux-musl` entry, then runs
    `bun scripts/build.ts --native --all` (the `--all` path is the only zig
    build flow that doesn't trigger the build_runner panic, see below).
-4. **`builder` stage**: reuses the OpenCode clone, applies the filesystem
-   import patch, runs `bun install --frozen-lockfile`, then
+4. **`builder` stage**: reuses the OpenCode clone, runs
+   `bun install --frozen-lockfile`, then
    overwrites the glibc-linked `libopentui.so` in
    `node_modules/@opentui/core-linux-x64/` with the musl-built one. `bun build
 --compile` then embeds the musl `.so` via bunfs.
@@ -268,11 +268,15 @@ group -> plugin-internal -> @opencode/v2/FileSystem -> undefined
 ```
 
 The Dockerfile installs the Bun version pinned by the requested upstream
-release instead of using the floating `oven/bun:debian` image. It also applies
-`build/legacy-glibc/filesystem-search.patch`, which imports runtime schemas
-directly from `@opencode-ai/schema/filesystem` and retains a type-only import
-from `filesystem.ts`. If upstream changes prevent the patch from applying,
-review whether the cycle still exists before updating or removing the patch.
+release instead of using the floating `oven/bun:debian` image. A local patch
+previously broke the cycle by importing runtime schemas directly from
+`@opencode-ai/schema/filesystem` and retaining a type-only import from
+`filesystem.ts`.
+
+Upstream v1.18.32 includes this fix. Applying the local patch to that release
+failed because the source was already fixed. The patch and its Dockerfile step
+have been removed because this repository targets the latest upstream release.
+Test 14 continues to check runtime initialization.
 
 On September 9, 2026, a full v1.18.29 rebuild with Bun 1.3.14 and this patch
 passed all 14 compatibility tests on CentOS 7 with glibc 2.17. Testing the

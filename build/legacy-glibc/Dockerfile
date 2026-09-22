@@ -168,15 +168,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /build
 
-# FileSystem eagerly captures FileSystemSearch.node. Importing runtime schemas
-# back through FileSystem creates a cycle that can capture an undefined node.
-# Fail on patch drift so upstream changes require an explicit review.
-COPY filesystem-search.patch /tmp/filesystem-search.patch
-RUN if [ -f packages/core/src/filesystem/search.ts ]; then \
-        git apply --check /tmp/filesystem-search.patch \
-        && git apply /tmp/filesystem-search.patch; \
-    fi
-
 RUN bun install --frozen-lockfile
 
 # Replace the glibc-linked opentui .so with our musl-built one BEFORE running
