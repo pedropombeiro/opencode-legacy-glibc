@@ -8,9 +8,14 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Tag to build (e.g. v1.1.8). Leave empty to build latest upstream tag."
+        description: "Version to build (e.g. v2.0.16). Leave empty to build the latest @opencode/cli release on npm."
         required: false
         type: string
+      dry_run:
+        description: "Build and test only; skip the release and failure marker."
+        required: false
+        type: boolean
+        default: false
 
 jobs:
   check:
@@ -30,16 +35,23 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           if [[ -n "$INPUT_TAG" ]]; then
-            LATEST_TAG="$INPUT_TAG"
+            LATEST_TAG="v${INPUT_TAG#v}"
             echo "Using manually specified tag: $LATEST_TAG"
           else
-            # Get latest upstream tag
-            LATEST_TAG=$(curl -sf https://api.github.com/repos/anomalyco/opencode/releases/latest | jq -r '.tag_name')
-            echo "Latest upstream tag: $LATEST_TAG"
+            # OpenCode v2 is published to npm as @opencode/cli; upstream does not
+            # create GitHub Releases for v2 tags.
+            NPM_VERSION=$(curl -sf https://registry.npmjs.org/@opencode/cli | jq -r '."dist-tags".latest // empty')
+            if [[ -z "$NPM_VERSION" ]]; then
+              echo "Could not resolve latest @opencode/cli version from npm"
+              echo "should_build=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            LATEST_TAG="v${NPM_VERSION}"
+            echo "Latest upstream version: $LATEST_TAG"
           fi
 
-          if [[ -z "$LATEST_TAG" || "$LATEST_TAG" == "null" ]]; then
-            echo "No tags found"
+          if [[ ! "$LATEST_TAG" =~ ^v2\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Refusing to build unexpected version: $LATEST_TAG (only stable v2.x.y is supported)"
             echo "should_build=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -108,7 +120,7 @@ jobs:
             sh /opt/test-env.sh
 
       - name: Record rejected build
-        if: steps.test.outcome == 'failure'
+        if: steps.test.outcome == 'failure' && inputs.dry_run != true
         env:
           FAILED_MARKER: ${{ needs.check.outputs.failed_marker }}
         run: |
@@ -135,10 +147,11 @@ jobs:
           path: out/opencode-${{ needs.check.outputs.tag }}-linux-x64-legacy-glibc.tar.gz
 
       - name: Create release
+        if: inputs.dry_run != true
         run: |
           gh release create "${{ needs.check.outputs.tag }}" \
             --title "OpenCode ${{ needs.check.outputs.tag }} (Legacy GLIBC)" \
-            --notes "OpenCode ${{ needs.check.outputs.tag }} built with bundled musl libraries for systems with older GLIBC versions.
+            --notes "OpenCode ${{ needs.check.outputs.tag }} repackaged with bundled musl libraries for systems with older GLIBC versions.
 
           ## Installation
           1. Using mise:
@@ -151,7 +164,8 @@ jobs:
             1. Download and extract the tarball
             2. Run \`./opencode/bin/opencode\`
 
-          Based on upstream release: https://github.com/anomalyco/opencode/releases/tag/${{ needs.check.outputs.tag }}" \
+          Based on upstream tag: https://github.com/anomalyco/opencode/tree/${{ needs.check.outputs.tag }}
+          Documentation: https://opencode.ai/v2/docs/" \
             out/opencode-${{ needs.check.outputs.tag }}-linux-x64-legacy-glibc.tar.gz
         env:
           GH_TOKEN: ${{ github.token }}
