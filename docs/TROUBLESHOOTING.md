@@ -2,9 +2,16 @@
 
 ## Architecture Overview
 
-The legacy-glibc build repackages the upstream OpenCode binary (a Bun/TypeScript app) to run on
+The legacy-glibc build repackages the upstream OpenCode v2 binary (a Bun/TypeScript app) to run on
 systems with old GLIBC (e.g., QNAP NAS with GLIBC 2.21). It replaces the GLIBC dependency with
 bundled **musl libc** libraries.
+
+Upstream publishes a musl baseline build as the npm package
+`@opencode/cli-linux-x64-baseline-musl`. It already embeds musl builds of every native
+dependency (`@opentui/core`, `@parcel/watcher`, fff) and a static-pie `opencode-pty`. The
+Dockerfile downloads it, verifies the npm `sha512` integrity, and runs
+`patchelf --set-interpreter` so it uses the bundled musl loader instead of
+`/lib/ld-musl-x86_64.so.1`, which doesn't exist on glibc systems.
 
 ### Wrapper chain
 
@@ -14,7 +21,8 @@ bin/opencode            (outer wrapper — creates musl loader symlink + .path f
        └─ lib/opencode  (patched ELF binary using musl dynamic linker)
 ```
 
-When opencode re-invokes itself via `process.execPath` (plugin install):
+When opencode re-invokes itself via `process.execPath` (plugin install, the
+`--standalone` server, and the background service `serve --service`):
 
 ```
 lib/opencode            (called directly — musl linker finds libs via .path file)
@@ -29,7 +37,7 @@ No wrapper or `LD_LIBRARY_PATH` needed for re-invocation. The musl linker reads
 | ------------------------- | ---------------------------------------------------------------- |
 | `bin/opencode`            | Outer shell wrapper — creates musl loader symlink + `.path` file |
 | `bin/opencode.bin`        | Inner shell wrapper — sets `LD_PRELOAD`, exec's real binary      |
-| `lib/opencode`            | Patched OpenCode ELF binary (~152MB, musl dynamic linker)        |
+| `lib/opencode`            | Patched OpenCode ELF binary (~200MB, musl dynamic linker)        |
 | `lib/ld-musl-x86_64.so.1` | musl dynamic linker (from Alpine)                                |
 | `lib/libstdc++.so.6`      | C++ standard library (from Alpine, musl-compiled)                |
 | `lib/libgcc_s.so.1`       | GCC support library (from Alpine, musl-compiled)                 |
@@ -107,6 +115,34 @@ is loadable by any libc.
    **Verified on QNAP NAS (GLIBC 2.21):** all 5 plugins install successfully, node/git/MCP
    servers work, no `LD_LIBRARY_PATH` or `LD_PRELOAD` leaks to child processes.
 
+## OpenCode v2 Notes
+
+### Background service
+
+v2 uses a client-server architecture. The TUI and most commands connect to a shared
+background service, started as `lib/opencode serve --service` through `process.execPath`.
+It finds its libraries through the same `.path` file as plugin installs. The `.path` file and
+loader symlink live in `/tmp`, so run `bin/opencode` at least once after a reboot or `/tmp`
+cleanup before the service is restarted. Use `opencode service status`, `opencode service
+restart`, and `opencode --standalone` to diagnose service problems.
+
+### Self-update
+
+The v2 updater detects its install method from a `package.json` next to the binary, a
+Homebrew Cellar path, or `~/.opencode/bin/opencode`. This layout matches none of them, so
+`opencode upgrade` can't replace the patched binary with a stock upstream build. Update
+through mise or by downloading a newer release.
+
+### Local testing on Apple Silicon is unreliable
+
+Under Colima or other QEMU-based `linux/amd64` emulation, the v2 binary (Bun 1.4.2)
+segfaults intermittently, roughly 1 in 3 runs of `opencode --version`. The unpatched
+upstream binary on Alpine crashes at the same rate, so the repackaging isn't the cause.
+The v1.18.32 release (Bun 1.3.14) doesn't crash under the same emulation. The emulated CPU
+reports no AVX, so it's unclear whether this is a QEMU artifact or a Bun bug on CPUs
+without AVX. Use the GitHub Actions run (real x86) as the source of truth, and test on
+the target hardware.
+
 ## Known Issues & Gotchas
 
 ### 1. patchelf --set-rpath causes segfaults on Bun binaries
@@ -160,7 +196,11 @@ the binary, before resolving symlinks). It extracts the grandparent directory:
 
 If you change the `patchelf --set-interpreter` path, the `.path` file location changes too.
 
-## OpenTUI Native Library Substitution (Issue #3)
+## OpenTUI Native Library Substitution (Issue #3, v1 only)
+
+> **History.** This section applies to v1 builds. OpenCode v2 ships an official musl build that
+> embeds `@opentui/core-linux-x64-musl`, so the Zig rebuild was removed. It's kept for
+> reference in case a future upstream build regresses.
 
 Starting with opencode `1.14.49`, the bundled `@opentui/core@0.2.7+` no longer
 loads its native renderer through Bun's embedded imports. Instead, the loader
@@ -191,7 +231,7 @@ real failure is the GLIBC symbol version requirement.)
 
 ### Fix: rebuild opentui against musl
 
-`build/legacy-glibc/Dockerfile` rebuilds `@opentui/core-linux-x64/libopentui.so`
+The v1 `build/legacy-glibc/Dockerfile` (see git history) rebuilt `@opentui/core-linux-x64/libopentui.so`
 from source as part of the build pipeline:
 
 1. **`opencode-clone` stage**: clones the requested `opencode` tag and reads
@@ -244,7 +284,7 @@ the `Failed to initialize OpenTUI render library` error is not present.
 
 ## Testing
 
-### Runtime initialization regression in Bun 1.4.x builds
+### Runtime initialization regression in Bun 1.4.x builds (v1 only)
 
 The legacy v1.18.28 and v1.18.29 artifacts built with Bun 1.4.1 fail during
 service graph initialization with:
@@ -289,16 +329,20 @@ in Docker, so the NAS-specific v1.18.27 failure remains unconfirmed.
 ### Build the artifact
 
 ```bash
-docker buildx build --platform linux/amd64 --build-arg VERSION=v1.15.0 \
+docker buildx build --platform linux/amd64 --build-arg VERSION=v2.0.16 \
   -f build/legacy-glibc/Dockerfile -o out build/legacy-glibc/
 ```
 
+To run CI without publishing, trigger the workflow manually with `dry_run` enabled.
+
 ### Run the automated test suite
 
-The test script (`build/test/test-env.sh`) runs 14 tests covering wrapper chain,
+The test script (`build/test/test-env.sh`) runs 16 tests covering wrapper chain,
 direct binary launch, plugin install, process.execPath re-invocation, LD_PRELOAD safety, git
 compatibility, the OpenTUI native library load (regression test for issue #3),
-and runtime initialization through `opencode debug v2`. No API key is required.
+runtime initialization (`debug config`, `debug paths`), a `--standalone` server request,
+and the background service lifecycle. No API key is required. Every opencode call runs
+under `timeout -s KILL`, so a crash or stuck TUI can't hang the suite.
 
 ```bash
 # Build and test on a specific distro
@@ -315,7 +359,7 @@ docker run --platform linux/amd64 --rm opencode-test-centos7 sh /opt/test-env.sh
 
 ### GLIBC compatibility matrix
 
-Tested and passing (13/13 tests) as of v1.15.0:
+Tested and passing (13/13 tests) as of v1.15.0. v2 results are pending a run on real x86:
 
 | Image               | GLIBC | Status |
 | ------------------- | ----- | ------ |
