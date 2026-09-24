@@ -6,7 +6,13 @@
 # LD_LIBRARY_PATH is NOT needed — the musl dynamic linker finds bundled
 # libs via /tmp/.opencode-ld/ld-musl-x86_64.path (set up by bin/opencode).
 
-SCRIPT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+SELF="$0"
+case "$SELF" in
+    */*) ;;
+    *) SELF="$(command -v -- "$SELF" 2>/dev/null || printf '%s' "$SELF")" ;;
+esac
+SELF="$(readlink -f "$SELF" 2>/dev/null || printf '%s' "$SELF")"
+SCRIPT_DIR="$(cd "$(dirname "$SELF")/.." && pwd)"
 
 LD_PRELOAD="${SCRIPT_DIR}/lib/clear_ldpath.so" \
     exec "${SCRIPT_DIR}/lib/opencode" "$@"

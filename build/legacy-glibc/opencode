@@ -2,7 +2,19 @@
 # Wrapper script to run opencode with bundled musl libraries
 # This enables running on systems with older GLIBC versions
 
-SCRIPT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+# Resolve our own location robustly: $0 may be a bare name (PATH lookup) or a
+# symlink (e.g. a version manager shim), either of which breaks `dirname "$0"`.
+SELF="$0"
+case "$SELF" in
+    */*) ;;
+    *) SELF="$(command -v -- "$SELF" 2>/dev/null || printf '%s' "$SELF")" ;;
+esac
+SELF="$(readlink -f "$SELF" 2>/dev/null || printf '%s' "$SELF")"
+SCRIPT_DIR="$(cd "$(dirname "$SELF")/.." && pwd)"
+if [ ! -x "${SCRIPT_DIR}/bin/opencode.bin" ]; then
+    echo "opencode wrapper: cannot locate bin/opencode.bin (resolved $0 to $SELF)" >&2
+    exit 127
+fi
 
 # Set up the musl loader symlink and library path file.
 # The binary is patched (via patchelf) to use /tmp/.opencode-ld/ld-musl-x86_64.so.1
