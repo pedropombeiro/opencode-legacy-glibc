@@ -5,11 +5,14 @@
 # Architecture:
 #   bin/opencode      -> creates musl .path file + loader symlink -> bin/opencode.bin
 #   bin/opencode.bin  -> sets LD_PRELOAD=clear_ldpath.so -> lib/opencode
-#   lib/opencode      -> real 152MB musl-linked binary
+#   lib/opencode      -> upstream OpenCode v2 musl baseline binary (patched interpreter)
 #   clear_ldpath.so   -> clears LD_PRELOAD from environ
 #
-# The musl dynamic linker finds libs via /tmp/.opencode-ld/ld-musl-x86_64.path
+# The musl dynamic linker finds libs via /tmp/etc/ld-musl-x86_64.path
 # instead of LD_LIBRARY_PATH. This is invisible to glibc, solving the catch-22.
+#
+# Every opencode invocation runs under `timeout -s KILL` so a Bun crash handler
+# or a stuck TUI can never hang the suite.
 #
 # Usage: docker run --platform linux/amd64 --rm <image> sh /opt/test-env.sh
 
@@ -17,6 +20,7 @@ set -e
 
 PASS=0
 FAIL=0
+T="timeout -s KILL"
 
 pass() {
   PASS=$((PASS + 1))
@@ -36,7 +40,7 @@ ln -sf "$LIB/ld-musl-x86_64.so.1" "$LOADER_DIR/ld-musl-x86_64.so.1"
 printf '%s' "$LIB" >/tmp/etc/ld-musl-x86_64.path
 
 echo "=== 1. Wrapper chain launches opencode ==="
-if "$BIN/opencode" --version >/dev/null 2>&1; then
+if $T 30 "$BIN/opencode" --version >/dev/null 2>&1; then
   pass "opencode --version via wrapper"
 else
   fail "opencode --version via wrapper"
@@ -44,9 +48,9 @@ fi
 
 echo ""
 echo "=== 2. Direct binary launches via .path file ==="
-OC_VER=$("$LIB/opencode" --version 2>&1) || true
-if echo "$OC_VER" | grep -qE '^[0-9]+\.[0-9]+'; then
-  pass "lib/opencode works via .path file: v$OC_VER"
+OC_VER=$($T 30 "$LIB/opencode" --version 2>&1) || true
+if echo "$OC_VER" | grep -qE '^(opencode )?v?[0-9]+\.[0-9]+'; then
+  pass "lib/opencode works via .path file: $OC_VER"
 else
   fail "lib/opencode failed: $OC_VER"
 fi
@@ -83,7 +87,7 @@ fi
 echo ""
 echo "=== 6. BUN_BE_BUN=1 launches bun ==="
 BUN_VERSION=$(
-  BUN_BE_BUN=1 "$LIB/opencode" --version 2>&1
+  BUN_BE_BUN=1 $T 30 "$LIB/opencode" --version 2>&1
 ) || true
 if echo "$BUN_VERSION" | grep -qE '^[0-9]+\.[0-9]+'; then
   pass "BUN_BE_BUN=1 works: bun $BUN_VERSION"
@@ -103,7 +107,7 @@ try {
 }
 JSEOF
 GRANDCHILD=$(
-  BUN_BE_BUN=1 "$LIB/opencode" run /tmp/test_grandchild.js 2>/dev/null
+  BUN_BE_BUN=1 $T 30 "$LIB/opencode" run /tmp/test_grandchild.js 2>/dev/null
 ) || true
 if [ "$GRANDCHILD" = "grandchild_ok" ]; then
   pass "grandchild glibc process runs without crashing"
@@ -120,7 +124,7 @@ process.stdout.write(out);
 JSEOF
 CHILD_LD=$(
   LD_PRELOAD="$LIB/clear_ldpath.so" BUN_BE_BUN=1 \
-    "$LIB/opencode" run /tmp/test_no_ldpath.js 2>/dev/null
+    $T 30 "$LIB/opencode" run /tmp/test_no_ldpath.js 2>/dev/null
 ) || true
 if [ -z "$CHILD_LD" ]; then
   pass "LD_LIBRARY_PATH not set in grandchild"
@@ -144,7 +148,7 @@ try {
 JSEOF
 REINVOKE=$(
   LD_PRELOAD="$LIB/clear_ldpath.so" BUN_BE_BUN=1 \
-    "$LIB/opencode" run /tmp/test_reinvoke.js 2>/dev/null
+    $T 30 "$LIB/opencode" run /tmp/test_reinvoke.js 2>/dev/null
 ) || true
 if echo "$REINVOKE" | grep -qE '^[0-9]+\.[0-9]+'; then
   pass "process.execPath re-invocation works: bun $REINVOKE"
@@ -156,7 +160,7 @@ echo ""
 echo "=== 10. Plugin install succeeds ==="
 mkdir -p /tmp/testpkg
 echo '{}' >/tmp/testpkg/package.json
-if BUN_BE_BUN=1 "$LIB/opencode" add --cwd /tmp/testpkg opencode-anthropic-auth@0.0.13 >/dev/null 2>&1; then
+if BUN_BE_BUN=1 $T 120 "$LIB/opencode" add --cwd /tmp/testpkg opencode-anthropic-auth@0.0.13 >/dev/null 2>&1; then
   PKG_COUNT=$(find /tmp/testpkg/node_modules/ -mindepth 1 -maxdepth 1 2>/dev/null | wc -l)
   if [ "$PKG_COUNT" -gt 0 ]; then
     pass "plugin install: $PKG_COUNT packages in node_modules"
@@ -178,24 +182,27 @@ fi
 echo ""
 echo "=== 12. opencode.bin wrapper works ==="
 OC_VERSION2=$(
-  "$BIN/opencode.bin" --version 2>&1
+  $T 30 "$BIN/opencode.bin" --version 2>&1
 ) || true
-if echo "$OC_VERSION2" | grep -qE '^[0-9]+\.[0-9]+'; then
-  pass "opencode.bin wrapper works: v$OC_VERSION2"
+if echo "$OC_VERSION2" | grep -qE '^(opencode )?v?[0-9]+\.[0-9]+'; then
+  pass "opencode.bin wrapper works: $OC_VERSION2"
 else
   fail "opencode.bin wrapper failed: $OC_VERSION2"
 fi
 
 echo ""
 echo "=== 13. OpenTUI native library loads (regression test for issue #3) ==="
-# opencode 1.14.49+ extracts the @opentui/core .so from bunfs and dlopen's it.
-# Upstream ships it linked against glibc 2.28+, which fails on glibc 2.21 (QTS
-# 5.2.9) and on glibc 2.17 (centos7). We rebuild it against musl. This test
-# triggers the dlopen path by running opencode with stdin closed and TUI logs
-# enabled, and asserts the failure message is absent. timeout uses SIGKILL so
-# the TUI cannot ignore the signal and the test cannot hang.
-TUI_OUT=$(timeout -s KILL 10 "$BIN/opencode" --print-logs --log-level ERROR </dev/null 2>&1 || true)
-if echo "$TUI_OUT" | grep -q "Failed to initialize OpenTUI render library"; then
+# OpenCode extracts the @opentui/core .so from bunfs and dlopen's it. The
+# glibc variant needs glibc 2.28+, which fails on glibc 2.21 (QTS 5.2.9) and
+# glibc 2.17 (centos7). The upstream v2 musl build embeds the musl variant.
+# This test triggers the dlopen path by running the TUI with stdin closed and
+# logs on stderr, and asserts neither the load error nor a crash is present.
+# --standalone keeps the server in-process so no background service is left over.
+TUI_OUT=$($T 15 "$BIN/opencode" --standalone --print-logs </dev/null 2>&1 || true)
+if echo "$TUI_OUT" | grep -qE 'Segmentation fault|Bun has crashed'; then
+  fail "TUI startup crashed"
+  echo "$TUI_OUT" | grep -E 'panic|Segmentation|bun.report' | head -5
+elif echo "$TUI_OUT" | grep -q "Failed to initialize OpenTUI render library"; then
   fail "OpenTUI native library failed to load — issue #3 regression"
   echo "$TUI_OUT" | grep -A2 "Failed to initialize OpenTUI" | head -6
 elif echo "$TUI_OUT" | grep -qE 'GLIBC_2\.(2[5-9]|3[0-9])'; then
@@ -207,14 +214,49 @@ fi
 
 echo ""
 echo "=== 14. OpenCode runtime initializes without internal errors ==="
-# `debug v2` exercises the runtime's dependency graph without an LLM API key.
-# A bundled dependency initialization regression in v1.18.28+ crashed here with:
-# TypeError: undefined is not an object (evaluating 'a.name')
-if RUNTIME_OUT=$(timeout 30 "$BIN/opencode" --print-logs --log-level DEBUG debug v2 2>&1); then
-  pass "opencode runtime initializes"
+# `debug config` loads the configuration service graph without an LLM API key.
+if RUNTIME_OUT=$($T 60 "$BIN/opencode" --print-logs debug config 2>&1) \
+  && PATHS_OUT=$($T 30 "$BIN/opencode" debug paths 2>&1) \
+  && echo "$PATHS_OUT" | grep -qE '^data +/'; then
+  pass "opencode runtime initializes (debug config, debug paths)"
 else
   fail "opencode runtime initialization failed"
-  printf '%s\n' "$RUNTIME_OUT"
+  printf '%s\n%s\n' "$RUNTIME_OUT" "${PATHS_OUT:-}" | tail -30
+fi
+
+echo ""
+echo "=== 15. Standalone server answers API requests ==="
+# Starts `lib/opencode serve` as a child process (via process.execPath) and
+# queries it, exercising the server stack and self re-invocation.
+if API_OUT=$($T 90 "$BIN/opencode" api --standalone get /api/info 2>&1) \
+  && echo "$API_OUT" | grep -q '"version"'; then
+  pass "standalone server responds to /api/info"
+else
+  fail "standalone server request failed"
+  printf '%s\n' "$API_OUT" | tail -30
+fi
+
+echo ""
+echo "=== 16. Background service lifecycle ==="
+# The TUI and most commands talk to a shared background service spawned as
+# `lib/opencode serve --service`. It must start, answer requests, and stop.
+SVC_OK=true
+SVC_LOG=""
+for step in "service start" "service status" "api get /api/info" "service stop"; do
+  # shellcheck disable=SC2086
+  if ! STEP_OUT=$($T 90 "$BIN/opencode" $step 2>&1); then
+    SVC_OK=false
+    SVC_LOG="$SVC_LOG
+--- opencode $step
+$STEP_OUT"
+    break
+  fi
+done
+if $SVC_OK; then
+  pass "background service starts, responds, and stops"
+else
+  fail "background service lifecycle failed"
+  printf '%s\n' "$SVC_LOG" | tail -30
 fi
 
 echo ""
