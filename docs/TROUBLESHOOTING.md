@@ -140,8 +140,11 @@ segfaults intermittently, roughly 1 in 3 runs of `opencode --version`. The unpat
 upstream binary on Alpine crashes at the same rate, so the repackaging isn't the cause.
 The v1.18.32 release (Bun 1.3.14) doesn't crash under the same emulation. The emulated CPU
 reports no AVX, so it's unclear whether this is a QEMU artifact or a Bun bug on CPUs
-without AVX. Use the GitHub Actions run (real x86) as the source of truth, and test on
-the target hardware.
+without AVX. The same binary passes the full suite on GitHub Actions x86 runners, which
+have AVX. Use CI as the source of truth, and test on the target hardware.
+
+Each QEMU crash writes a core dump of several GB. Run local test containers with
+`--ulimit core=0`, or the dumps can fill the Colima disk.
 
 ## Known Issues & Gotchas
 
@@ -359,7 +362,9 @@ docker run --platform linux/amd64 --rm opencode-test-centos7 sh /opt/test-env.sh
 
 ### GLIBC compatibility matrix
 
-Tested and passing (13/13 tests) as of v1.15.0. v2 results are pending a run on real x86:
+v2.0.16 passes 16/16 tests on `centos:7` (glibc 2.17) on GitHub Actions x86 runners.
+
+Tested and passing (13/13 tests) as of v1.15.0:
 
 | Image               | GLIBC | Status |
 | ------------------- | ----- | ------ |
